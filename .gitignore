@@ -24,3 +24,4 @@ out/
 .DS_Store
 .env
 .env.local
+GITHUB_PUSH.md
