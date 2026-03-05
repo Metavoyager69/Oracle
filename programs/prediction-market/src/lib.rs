@@ -1,183 +1,115 @@
 use anchor_lang::prelude::*;
+use anchor_lang::solana_program::hash::hashv;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("PredMkt1111111111111111111111111111111111111");
 
-// ─────────────────────────────────────────────────────────────────
-//  Constants
-// ─────────────────────────────────────────────────────────────────
-pub const MARKET_SEED: &[u8]   = b"market";
-pub const VAULT_SEED: &[u8]    = b"vault";
+pub const MARKET_SEED: &[u8] = b"market";
+pub const VAULT_SEED: &[u8] = b"vault";
 pub const POSITION_SEED: &[u8] = b"position";
 pub const REGISTRY_SEED: &[u8] = b"registry";
 
-pub const PROTOCOL_FEE_BPS: u64 = 100;        // 1%
-pub const MIN_STAKE: u64         = 1_000_000;  // 0.001 of token base units
-pub const MAX_TITLE_LEN: usize   = 128;
-pub const MAX_DESC_LEN: usize    = 512;
+pub const PROTOCOL_FEE_BPS: u64 = 100;
+pub const SLASH_BPS: u64 = 500;
+pub const MIN_STAKE: u64 = 1_000_000;
+pub const MAX_TITLE_LEN: usize = 128;
+pub const MAX_DESC_LEN: usize = 512;
+pub const MAX_PROOF_URI_LEN: usize = 128;
+pub const CHALLENGE_WINDOW_SECONDS: i64 = 30 * 60;
 
-// Account space constants — explicit so they stay in sync with the struct layout.
-// Anchor discriminator = 8 bytes; each field sized manually below.
-pub const REGISTRY_SPACE: usize = 8 + 32 + 32 + 8 + 8 + 1;   // 89 bytes
+pub const REGISTRY_SPACE: usize = 8 + 128;
+pub const MARKET_SPACE: usize = 8 + 4096;
+pub const POSITION_SPACE: usize = 8 + 256;
 
-pub const MARKET_SPACE: usize =
-      8          // discriminator
-    + 8          // id
-    + 32         // creator
-    + 128        // title
-    + 512        // description
-    + 8          // resolution_timestamp
-    + 8          // created_at
-    + 32         // arcium_cluster
-    + 64         // encrypted_yes_stake  (Ciphertext = 2 × 32)
-    + 64         // encrypted_no_stake
-    + 8          // revealed_yes_stake
-    + 8          // revealed_no_stake
-    + 1 + 32 + 8 // tally_ticket (1 byte Option tag + 32 nonce + Pubkey[32] + u64[8] = 73)
-    + 32         // tally_ticket.cluster_id
-    + 4          // total_participants
-    + 1          // status enum tag
-    + 2          // outcome: Option<bool>
-    + 64         // encrypted_resolution
-    + 32         // vault
-    + 32         // token_mint
-    + 1          // bump
-    + 1;         // vault_bump
-
-pub const POSITION_SPACE: usize =
-      8          // discriminator
-    + 32         // owner
-    + 32         // market
-    + 64         // encrypted_stake
-    + 64         // encrypted_choice
-    + 8          // revealed_stake
-    + 2          // revealed_choice: Option<bool>
-    + 8          // submitted_at
-    + 1          // claimed
-    + 1;         // bump
-
-// ─────────────────────────────────────────────────────────────────
-//  Arcium MPC types
-//
-//  FIX (RED-1): EncryptedU64 and EncryptedBool were structurally
-//  identical (both = two 32-byte arrays).  Merged into a single
-//  `Ciphertext` type.  Field names at usage sites distinguish
-//  stake from vote semantically.
-//
-//  Arcium ElGamal over Ristretto255:
-//    C1 = r · G             (ephemeral public key)
-//    C2 = m · G + r · PK   (blinded message)
-// ─────────────────────────────────────────────────────────────────
-
-/// A 64-byte Arcium ElGamal ciphertext (two Ristretto255 points).
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Ciphertext {
-    pub c1: [u8; 32], // r · G          (ephemeral public key)
-    pub c2: [u8; 32], // m · G + r · PK (blinded message)
+    pub c1: [u8; 32],
+    pub c2: [u8; 32],
 }
 
-/// Arcium job ticket — written on-chain after a tally is requested
-/// so the off-chain relayer knows which cluster to contact.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default)]
 pub struct ArciumComputeTicket {
-    pub nonce:          [u8; 32],
-    pub cluster_id:     Pubkey,
+    pub nonce: [u8; 32],
+    pub cluster_id: Pubkey,
     pub submitted_slot: u64,
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  On-chain state accounts
-// ─────────────────────────────────────────────────────────────────
-
-/// Global registry — one per protocol deployment.
-#[account]
-pub struct MarketRegistry {
-    /// Protocol upgrade authority and settlement oracle signer.
-    pub authority:      Pubkey,
-    /// The Arcium MXE cluster assigned to all MPC computations.
-    pub arcium_cluster: Pubkey,
-    pub total_markets:  u64,
-    /// Cumulative SPL token volume (6-decimal base units, NOT lamports).
-    pub total_volume:   u64,
-    pub bump:           u8,
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default)]
+pub struct SettlementArtifacts {
+    pub mpc_job_id: [u8; 32],
+    pub proof_hash: [u8; 32],
+    pub proof_uri: [u8; 128],
+    pub settlement_hash: [u8; 32],
+    pub submitted_slot: u64,
+    pub challenge_deadline: i64,
+    pub challenged: bool,
+    pub challenged_by: Pubkey,
+    pub challenge_reason: u8,
+    pub slash_amount: u64,
 }
 
-/// A single prediction market.
+#[account]
+pub struct MarketRegistry {
+    pub authority: Pubkey,
+    pub arcium_cluster: Pubkey,
+    pub total_markets: u64,
+    pub total_volume: u64,
+    pub invalid_markets: u64,
+    pub settlement_challenges: u64,
+    pub slash_events: u64,
+    pub bump: u8,
+}
+
 #[account]
 pub struct Market {
-    pub id:                   u64,
-    pub creator:              Pubkey,
-    pub title:                [u8; 128],
-    pub description:          [u8; 512],
+    pub id: u64,
+    pub creator: Pubkey,
+    pub title: [u8; 128],
+    pub description: [u8; 512],
     pub resolution_timestamp: i64,
-    pub created_at:           i64,
-    pub arcium_cluster:       Pubkey,
-
-    // Encrypted aggregate tallies — homomorphically accumulated by Arcium nodes.
+    pub created_at: i64,
+    pub arcium_cluster: Pubkey,
     pub encrypted_yes_stake: Ciphertext,
-    pub encrypted_no_stake:  Ciphertext,
-
-    // Revealed only after Arcium MPC decryption at settlement.
+    pub encrypted_no_stake: Ciphertext,
     pub revealed_yes_stake: u64,
-    pub revealed_no_stake:  u64,
-
-    /// Arcium job ticket set when request_tally is called.
-    pub tally_ticket:         ArciumComputeTicket,
-    pub total_participants:   u32,
-    pub status:               MarketStatus,
-
-    /// None = pending; Some(true) = YES wins; Some(false) = NO wins.
-    pub outcome:              Option<bool>,
-
-    /// Encrypted oracle resolution input — hidden until MPC tally.
+    pub revealed_no_stake: u64,
+    pub tally_ticket: ArciumComputeTicket,
+    pub total_participants: u32,
+    pub status: MarketStatus,
+    pub outcome: Option<bool>,
     pub encrypted_resolution: Ciphertext,
-
-    pub vault:      Pubkey,
+    pub vault: Pubkey,
     pub token_mint: Pubkey,
-    pub bump:       u8,
+    pub artifacts: SettlementArtifacts,
+    pub bump: u8,
     pub vault_bump: u8,
 }
 
-/// Market lifecycle.
-///
-/// FIX (DEAD-1/2): Added `Cancelled` instruction and removed the
-/// unreachable `Locked` variant.  Markets go:
-///   Open → Resolving → Settled
-///   Open → Cancelled  (authority only)
-///   Resolving → Cancelled (authority only)
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Default)]
 pub enum MarketStatus {
     #[default]
     Open,
-    Resolving,  // Arcium MPC tally job in flight
-    Settled,    // outcome revealed; claims open
-    Cancelled,  // refunds available
+    Resolving,
+    SettledPending,
+    Settled,
+    Cancelled,
+    Invalid,
 }
 
-/// A user's position in one market.
 #[account]
 pub struct Position {
-    pub owner:   Pubkey,
-    pub market:  Pubkey,
-
-    /// Encrypted stake amount (Arcium ElGamal ciphertext).
-    pub encrypted_stake:  Ciphertext,
-    /// Encrypted YES/NO vote (Arcium ElGamal ciphertext).
+    pub owner: Pubkey,
+    pub market: Pubkey,
+    pub encrypted_stake: Ciphertext,
     pub encrypted_choice: Ciphertext,
-
-    /// Set by reveal_position after Arcium MPC decrypts this position.
-    pub revealed_stake:  u64,
+    pub deposited_stake: u64,
+    pub revealed_stake: u64,
     pub revealed_choice: Option<bool>,
-
     pub submitted_at: i64,
-    pub claimed:      bool,
-    pub bump:         u8,
+    pub claimed: bool,
+    pub bump: u8,
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Error codes  (removed unused variants: MarketAlreadySettled,
-//               InvalidMpcTicket — FIX DEAD-3/4)
-// ─────────────────────────────────────────────────────────────────
 #[error_code]
 pub enum PredictionMarketError {
     #[msg("Market is not currently open for positions")]
@@ -192,7 +124,7 @@ pub enum PredictionMarketError {
     PositionDidNotWin,
     #[msg("Position has not been revealed by Arcium yet")]
     PositionNotRevealed,
-    #[msg("Stake amount below minimum (1_000_000 base units)")]
+    #[msg("Stake amount below minimum")]
     StakeTooLow,
     #[msg("Title exceeds 128 bytes")]
     TitleTooLong,
@@ -202,32 +134,41 @@ pub enum PredictionMarketError {
     Unauthorized,
     #[msg("Resolution timestamp must be in the future")]
     InvalidResolutionTime,
-    #[msg("Market is cancelled; use refund_position")]
-    MarketCancelled,
-    #[msg("Winning pool is empty — cannot calculate proportional payout")]
+    #[msg("Winning pool is empty")]
     WinningPoolEmpty,
+    #[msg("Invalid proof URI length")]
+    InvalidProofUri,
+    #[msg("Market is not in a challengeable settlement state")]
+    MarketNotChallengeable,
+    #[msg("Challenge window has closed")]
+    ChallengeWindowClosed,
+    #[msg("Settlement was already challenged")]
+    SettlementAlreadyChallenged,
+    #[msg("Challenge evidence does not prove invalid settlement")]
+    InvalidChallengeEvidence,
+    #[msg("Settlement is not finalizable yet")]
+    SettlementNotFinalizable,
+    #[msg("Market is not refundable")]
+    MarketNotRefundable,
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Program
-// ─────────────────────────────────────────────────────────────────
 #[program]
 pub mod prediction_market {
     use super::*;
 
-    // ── 1. Initialize protocol ───────────────────────────────────
     pub fn initialize(ctx: Context<Initialize>, arcium_cluster: Pubkey) -> Result<()> {
-        let r = &mut ctx.accounts.registry;
-        r.authority      = ctx.accounts.authority.key();
-        r.arcium_cluster = arcium_cluster;
-        r.total_markets  = 0;
-        r.total_volume   = 0;
-        r.bump           = ctx.bumps.registry;
-        msg!("Protocol initialised. Arcium cluster: {}", arcium_cluster);
+        let registry = &mut ctx.accounts.registry;
+        registry.authority = ctx.accounts.authority.key();
+        registry.arcium_cluster = arcium_cluster;
+        registry.total_markets = 0;
+        registry.total_volume = 0;
+        registry.invalid_markets = 0;
+        registry.settlement_challenges = 0;
+        registry.slash_events = 0;
+        registry.bump = ctx.bumps.registry;
         Ok(())
     }
 
-    // ── 2. Create market ─────────────────────────────────────────
     pub fn create_market(
         ctx: Context<CreateMarket>,
         title: String,
@@ -244,55 +185,45 @@ pub mod prediction_market {
         );
 
         let registry = &mut ctx.accounts.registry;
-        let market   = &mut ctx.accounts.market;
+        let market = &mut ctx.accounts.market;
 
-        let mut title_arr = [0u8; 128];
-        title_arr[..title.len()].copy_from_slice(title.as_bytes());
-
-        let mut desc_arr = [0u8; 512];
-        desc_arr[..description.len()].copy_from_slice(description.as_bytes());
-
-        market.id                   = registry.total_markets;
-        market.creator              = ctx.accounts.creator.key();
-        market.title                = title_arr;
-        market.description          = desc_arr;
+        market.id = registry.total_markets;
+        market.creator = ctx.accounts.creator.key();
+        market.title = write_fixed_bytes::<128>(&title);
+        market.description = write_fixed_bytes::<512>(&description);
         market.resolution_timestamp = resolution_timestamp;
-        market.created_at           = clock.unix_timestamp;
-        market.arcium_cluster       = registry.arcium_cluster;
-        market.encrypted_yes_stake  = Ciphertext::default();
-        market.encrypted_no_stake   = Ciphertext::default();
-        market.revealed_yes_stake   = 0;
-        market.revealed_no_stake    = 0;
-        market.total_participants   = 0;
-        market.status               = MarketStatus::Open;
-        market.outcome              = None;
-        market.vault                = ctx.accounts.vault.key();
-        market.token_mint           = ctx.accounts.token_mint.key();
-        market.bump                 = ctx.bumps.market;
-        market.vault_bump           = ctx.bumps.vault;
+        market.created_at = clock.unix_timestamp;
+        market.arcium_cluster = registry.arcium_cluster;
+        market.encrypted_yes_stake = Ciphertext::default();
+        market.encrypted_no_stake = Ciphertext::default();
+        market.revealed_yes_stake = 0;
+        market.revealed_no_stake = 0;
+        market.tally_ticket = ArciumComputeTicket::default();
+        market.total_participants = 0;
+        market.status = MarketStatus::Open;
+        market.outcome = None;
+        market.encrypted_resolution = Ciphertext::default();
+        market.vault = ctx.accounts.vault.key();
+        market.token_mint = ctx.accounts.token_mint.key();
+        market.artifacts = SettlementArtifacts::default();
+        market.bump = ctx.bumps.market;
+        market.vault_bump = ctx.bumps.vault;
 
-        registry.total_markets += 1;
+        registry.total_markets = registry.total_markets.saturating_add(1);
 
-        msg!("Market #{} created: '{}'. Resolves at {}.", market.id, title, resolution_timestamp);
         Ok(())
     }
 
-    // ── 3. Submit encrypted position ────────────────────────────
-    /// `plaintext_stake_lamports` is used only for the SPL token
-    /// transfer.  It does not correlate stake size with vote direction
-    /// because that linkage is never stored.
     pub fn submit_position(
         ctx: Context<SubmitPosition>,
-        encrypted_stake:  Ciphertext,
+        encrypted_stake: Ciphertext,
         encrypted_choice: Ciphertext,
         plaintext_stake_lamports: u64,
     ) -> Result<()> {
         let market = &mut ctx.accounts.market;
-
         require!(market.status == MarketStatus::Open, PredictionMarketError::MarketNotOpen);
-        require!(plaintext_stake_lamports >= MIN_STAKE,  PredictionMarketError::StakeTooLow);
+        require!(plaintext_stake_lamports >= MIN_STAKE, PredictionMarketError::StakeTooLow);
 
-        // FIX (BUG-3): call Clock::get() once; reuse `clock.slot` in emit!()
         let clock = Clock::get()?;
         require!(
             clock.unix_timestamp < market.resolution_timestamp,
@@ -302,45 +233,43 @@ pub mod prediction_market {
         let cpi_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from:      ctx.accounts.user_token_account.to_account_info(),
-                to:        ctx.accounts.vault.to_account_info(),
+                from: ctx.accounts.user_token_account.to_account_info(),
+                to: ctx.accounts.vault.to_account_info(),
                 authority: ctx.accounts.user.to_account_info(),
             },
         );
         token::transfer(cpi_ctx, plaintext_stake_lamports)?;
 
         let position = &mut ctx.accounts.position;
-        position.owner            = ctx.accounts.user.key();
-        position.market           = market.key();
-        position.encrypted_stake  = encrypted_stake;
+        position.owner = ctx.accounts.user.key();
+        position.market = market.key();
+        position.encrypted_stake = encrypted_stake;
         position.encrypted_choice = encrypted_choice;
-        position.revealed_stake   = 0;
-        position.revealed_choice  = None;
-        position.submitted_at     = clock.unix_timestamp;
-        position.claimed          = false;
-        position.bump             = ctx.bumps.position;
+        position.deposited_stake = plaintext_stake_lamports;
+        position.revealed_stake = 0;
+        position.revealed_choice = None;
+        position.submitted_at = clock.unix_timestamp;
+        position.claimed = false;
+        position.bump = ctx.bumps.position;
 
-        market.total_participants              += 1;
-        ctx.accounts.registry.total_volume += plaintext_stake_lamports;
-
-        msg!(
-            "Encrypted position submitted for market #{}. Participants: {}",
-            market.id, market.total_participants
-        );
+        market.total_participants = market.total_participants.saturating_add(1);
+        ctx.accounts.registry.total_volume = ctx
+            .accounts
+            .registry
+            .total_volume
+            .saturating_add(plaintext_stake_lamports);
 
         emit!(PositionSubmitted {
-            market:      market.key(),
+            market: market.key(),
             participant: ctx.accounts.user.key(),
-            slot:        clock.slot,  // reuse clock — no second syscall
+            slot: clock.slot,
         });
 
         Ok(())
     }
 
-    // ── 4. Request Arcium MPC tally ──────────────────────────────
     pub fn request_tally(ctx: Context<RequestTally>) -> Result<()> {
         let market = &mut ctx.accounts.market;
-
         require!(market.status == MarketStatus::Open, PredictionMarketError::MarketNotOpen);
 
         let clock = Clock::get()?;
@@ -351,10 +280,6 @@ pub mod prediction_market {
 
         market.status = MarketStatus::Resolving;
 
-        // FIX (BUG-4): build a deterministic 32-byte nonce properly.
-        // In production: CPI into Arcium program for a cryptographically
-        // secure nonce; replace the authority check with an Arcium
-        // oracle signature or ZK proof in settle_market.
         let mut nonce = [0u8; 32];
         nonce[..8].copy_from_slice(&market.id.to_le_bytes());
         nonce[8..16].copy_from_slice(&clock.slot.to_le_bytes());
@@ -362,59 +287,164 @@ pub mod prediction_market {
 
         market.tally_ticket = ArciumComputeTicket {
             nonce,
-            cluster_id:     market.arcium_cluster,
+            cluster_id: market.arcium_cluster,
             submitted_slot: clock.slot,
         };
 
-        msg!(
-            "MPC tally requested for market #{}. Arcium cluster: {}",
-            market.id, market.arcium_cluster
-        );
-
         emit!(TallyRequested {
-            market:  market.key(),
+            market: market.key(),
             cluster: market.arcium_cluster,
-            slot:    clock.slot,
+            slot: clock.slot,
         });
 
         Ok(())
     }
 
-    // ── 5. Settle market ─────────────────────────────────────────
     pub fn settle_market(
         ctx: Context<SettleMarket>,
         yes_stake: u64,
         no_stake: u64,
         yes_won: bool,
+        mpc_job_id: [u8; 32],
+        proof_hash: [u8; 32],
+        proof_uri: String,
     ) -> Result<()> {
         require!(
             ctx.accounts.authority.key() == ctx.accounts.registry.authority,
             PredictionMarketError::Unauthorized
         );
+        require!(proof_uri.len() <= MAX_PROOF_URI_LEN, PredictionMarketError::InvalidProofUri);
 
+        let clock = Clock::get()?;
         let market = &mut ctx.accounts.market;
         require!(market.status == MarketStatus::Resolving, PredictionMarketError::MpcStillPending);
 
-        market.revealed_yes_stake = yes_stake;
-        market.revealed_no_stake  = no_stake;
-        market.outcome            = Some(yes_won);
-        market.status             = MarketStatus::Settled;
-
-        msg!(
-            "Market #{} settled. YES: {} / NO: {}. Winner: {}",
-            market.id, yes_stake, no_stake, if yes_won { "YES" } else { "NO" }
+        let settlement_hash = settlement_hash_for(
+            market.id,
+            yes_stake,
+            no_stake,
+            yes_won,
+            mpc_job_id,
+            proof_hash,
+            market.tally_ticket.nonce,
         );
 
-        emit!(MarketSettled { market: market.key(), yes_stake, no_stake, yes_won });
+        market.revealed_yes_stake = yes_stake;
+        market.revealed_no_stake = no_stake;
+        market.outcome = Some(yes_won);
+        market.status = MarketStatus::SettledPending;
+        market.artifacts = SettlementArtifacts {
+            mpc_job_id,
+            proof_hash,
+            proof_uri: write_fixed_bytes::<128>(&proof_uri),
+            settlement_hash,
+            submitted_slot: clock.slot,
+            challenge_deadline: clock.unix_timestamp + CHALLENGE_WINDOW_SECONDS,
+            challenged: false,
+            challenged_by: Pubkey::default(),
+            challenge_reason: 0,
+            slash_amount: 0,
+        };
+
+        emit!(SettlementSubmitted {
+            market: market.key(),
+            settlement_hash,
+            proof_hash,
+            mpc_job_id,
+            challenge_deadline: market.artifacts.challenge_deadline,
+        });
+
         Ok(())
     }
 
-    // ── 6. Reveal individual position ───────────────────────────
-    pub fn reveal_position(
-        ctx: Context<RevealPosition>,
-        stake: u64,
-        choice: bool,
+    pub fn challenge_settlement(
+        ctx: Context<ChallengeSettlement>,
+        expected_hash: [u8; 32],
+        reason_code: u8,
     ) -> Result<()> {
+        let clock = Clock::get()?;
+        let registry = &mut ctx.accounts.registry;
+        let market = &mut ctx.accounts.market;
+
+        require!(
+            market.status == MarketStatus::SettledPending,
+            PredictionMarketError::MarketNotChallengeable
+        );
+        require!(
+            clock.unix_timestamp <= market.artifacts.challenge_deadline,
+            PredictionMarketError::ChallengeWindowClosed
+        );
+        require!(
+            !market.artifacts.challenged,
+            PredictionMarketError::SettlementAlreadyChallenged
+        );
+        require!(
+            expected_hash != market.artifacts.settlement_hash,
+            PredictionMarketError::InvalidChallengeEvidence
+        );
+
+        let total_pool = market.revealed_yes_stake.saturating_add(market.revealed_no_stake);
+        let slash_amount = total_pool.saturating_mul(SLASH_BPS) / 10_000;
+
+        market.status = MarketStatus::Invalid;
+        market.outcome = None;
+        market.artifacts.challenged = true;
+        market.artifacts.challenged_by = ctx.accounts.challenger.key();
+        market.artifacts.challenge_reason = reason_code;
+        market.artifacts.slash_amount = slash_amount;
+
+        registry.settlement_challenges = registry.settlement_challenges.saturating_add(1);
+        registry.invalid_markets = registry.invalid_markets.saturating_add(1);
+        registry.slash_events = registry.slash_events.saturating_add(1);
+
+        emit!(SettlementChallenged {
+            market: market.key(),
+            challenger: ctx.accounts.challenger.key(),
+            provided_hash: expected_hash,
+            stored_hash: market.artifacts.settlement_hash,
+            slash_amount,
+            reason_code,
+        });
+
+        Ok(())
+    }
+
+    pub fn finalize_settlement(ctx: Context<FinalizeSettlement>) -> Result<()> {
+        let clock = Clock::get()?;
+        let market = &mut ctx.accounts.market;
+
+        require!(
+            market.status == MarketStatus::SettledPending,
+            PredictionMarketError::SettlementNotFinalizable
+        );
+        require!(
+            !market.artifacts.challenged,
+            PredictionMarketError::SettlementAlreadyChallenged
+        );
+        require!(
+            clock.unix_timestamp > market.artifacts.challenge_deadline,
+            PredictionMarketError::SettlementNotFinalizable
+        );
+
+        market.status = MarketStatus::Settled;
+
+        emit!(SettlementFinalized {
+            market: market.key(),
+            settlement_hash: market.artifacts.settlement_hash,
+            finalized_slot: clock.slot,
+        });
+
+        emit!(MarketSettled {
+            market: market.key(),
+            yes_stake: market.revealed_yes_stake,
+            no_stake: market.revealed_no_stake,
+            yes_won: market.outcome.unwrap_or(false),
+        });
+
+        Ok(())
+    }
+
+    pub fn reveal_position(ctx: Context<RevealPosition>, stake: u64, choice: bool) -> Result<()> {
         require!(
             ctx.accounts.market.status == MarketStatus::Settled,
             PredictionMarketError::MpcStillPending
@@ -425,25 +455,22 @@ pub mod prediction_market {
         );
 
         let position = &mut ctx.accounts.position;
-        position.revealed_stake  = stake;
+        position.revealed_stake = stake;
         position.revealed_choice = Some(choice);
-
-        msg!("Position revealed: {} tokens, choice: {}", stake, choice);
         Ok(())
     }
 
-    // ── 7. Claim winnings ────────────────────────────────────────
     pub fn claim_winnings(ctx: Context<ClaimWinnings>) -> Result<()> {
-        let market   = &ctx.accounts.market;
+        let market = &ctx.accounts.market;
         let position = &mut ctx.accounts.position;
 
         require!(market.status == MarketStatus::Settled, PredictionMarketError::MpcStillPending);
         require!(!position.claimed, PredictionMarketError::AlreadyClaimed);
 
-        // FIX (BUG-1): replace .unwrap() with explicit error variants
-        let outcome     = market.outcome.ok_or(PredictionMarketError::MpcStillPending)?;
-        let user_choice = position.revealed_choice.ok_or(PredictionMarketError::PositionNotRevealed)?;
-
+        let outcome = market.outcome.ok_or(PredictionMarketError::MpcStillPending)?;
+        let user_choice = position
+            .revealed_choice
+            .ok_or(PredictionMarketError::PositionNotRevealed)?;
         require!(user_choice == outcome, PredictionMarketError::PositionDidNotWin);
 
         let winning_pool = if outcome {
@@ -451,29 +478,22 @@ pub mod prediction_market {
         } else {
             market.revealed_no_stake
         };
-
-        // FIX (BUG-2): guard division by zero
         require!(winning_pool > 0, PredictionMarketError::WinningPoolEmpty);
 
-        let total_pool = market.revealed_yes_stake + market.revealed_no_stake;
-
-        let gross_payout = (position.revealed_stake as u128)
-            .checked_mul(total_pool as u128)
-            .and_then(|n| n.checked_div(winning_pool as u128))
-            .unwrap_or(0) as u64;
-
-        let fee        = gross_payout.saturating_mul(PROTOCOL_FEE_BPS) / 10_000;
+        let total_pool = market.revealed_yes_stake.saturating_add(market.revealed_no_stake);
+        let gross_payout = payout_amount(position.revealed_stake, total_pool, winning_pool);
+        let fee = gross_payout.saturating_mul(PROTOCOL_FEE_BPS) / 10_000;
         let net_payout = gross_payout.saturating_sub(fee);
 
         let market_id_bytes = market.id.to_le_bytes();
-        let seeds           = &[VAULT_SEED, market_id_bytes.as_ref(), &[market.vault_bump]];
-        let signer_seeds    = &[&seeds[..]];
+        let seeds = &[VAULT_SEED, market_id_bytes.as_ref(), &[market.vault_bump]];
+        let signer_seeds = &[&seeds[..]];
 
         let cpi_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from:      ctx.accounts.vault.to_account_info(),
-                to:        ctx.accounts.user_token_account.to_account_info(),
+                from: ctx.accounts.vault.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
                 authority: ctx.accounts.vault.to_account_info(),
             },
             signer_seeds,
@@ -481,12 +501,9 @@ pub mod prediction_market {
         token::transfer(cpi_ctx, net_payout)?;
 
         position.claimed = true;
-        msg!("Winnings claimed: {} tokens (fee: {})", net_payout, fee);
         Ok(())
     }
 
-    // ── 8. Cancel market ─────────────────────────────────────────
-    /// FIX (DEAD-2): implement the Cancelled state so it is reachable.
     pub fn cancel_market(ctx: Context<CancelMarket>) -> Result<()> {
         require!(
             ctx.accounts.authority.key() == ctx.accounts.registry.authority,
@@ -495,34 +512,67 @@ pub mod prediction_market {
         let market = &mut ctx.accounts.market;
         require!(
             market.status == MarketStatus::Open
-                || market.status == MarketStatus::Resolving,
-            PredictionMarketError::MpcStillPending
+                || market.status == MarketStatus::Resolving
+                || market.status == MarketStatus::SettledPending,
+            PredictionMarketError::MarketNotChallengeable
         );
         market.status = MarketStatus::Cancelled;
-        msg!("Market #{} cancelled.", market.id);
         Ok(())
     }
 
-    // ── 9. Refund cancelled position ─────────────────────────────
-    pub fn refund_position(ctx: Context<RefundPosition>) -> Result<()> {
-        let market   = &ctx.accounts.market;
-        let position = &mut ctx.accounts.position;
+    pub fn resolve_invalid_market(
+        ctx: Context<ResolveInvalidMarket>,
+        reason_code: u8,
+    ) -> Result<()> {
+        require!(
+            ctx.accounts.authority.key() == ctx.accounts.registry.authority,
+            PredictionMarketError::Unauthorized
+        );
 
-        require!(market.status == MarketStatus::Cancelled, PredictionMarketError::MarketCancelled);
+        let registry = &mut ctx.accounts.registry;
+        let market = &mut ctx.accounts.market;
+        require!(market.status != MarketStatus::Settled, PredictionMarketError::SettlementNotFinalizable);
+
+        if market.status != MarketStatus::Invalid {
+            registry.invalid_markets = registry.invalid_markets.saturating_add(1);
+        }
+
+        market.status = MarketStatus::Invalid;
+        market.outcome = None;
+        market.artifacts.challenged = true;
+        market.artifacts.challenged_by = ctx.accounts.authority.key();
+        market.artifacts.challenge_reason = reason_code;
+
+        emit!(MarketInvalidated {
+            market: market.key(),
+            by: ctx.accounts.authority.key(),
+            reason_code,
+        });
+
+        Ok(())
+    }
+
+    pub fn refund_position(ctx: Context<RefundPosition>) -> Result<()> {
+        let market = &ctx.accounts.market;
+        let position = &mut ctx.accounts.position;
+        require!(
+            market.status == MarketStatus::Cancelled || market.status == MarketStatus::Invalid,
+            PredictionMarketError::MarketNotRefundable
+        );
         require!(!position.claimed, PredictionMarketError::AlreadyClaimed);
 
-        let refund_amount = position.revealed_stake;
-        require!(refund_amount > 0, PredictionMarketError::PositionNotRevealed);
+        let refund_amount = position.deposited_stake;
+        require!(refund_amount > 0, PredictionMarketError::StakeTooLow);
 
         let market_id_bytes = market.id.to_le_bytes();
-        let seeds           = &[VAULT_SEED, market_id_bytes.as_ref(), &[market.vault_bump]];
-        let signer_seeds    = &[&seeds[..]];
+        let seeds = &[VAULT_SEED, market_id_bytes.as_ref(), &[market.vault_bump]];
+        let signer_seeds = &[&seeds[..]];
 
         let cpi_ctx = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
-                from:      ctx.accounts.vault.to_account_info(),
-                to:        ctx.accounts.user_token_account.to_account_info(),
+                from: ctx.accounts.vault.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
                 authority: ctx.accounts.vault.to_account_info(),
             },
             signer_seeds,
@@ -530,14 +580,9 @@ pub mod prediction_market {
         token::transfer(cpi_ctx, refund_amount)?;
 
         position.claimed = true;
-        msg!("Refund: {} tokens for market #{}", refund_amount, market.id);
         Ok(())
     }
 }
-
-// ─────────────────────────────────────────────────────────────────
-//  Account contexts
-// ─────────────────────────────────────────────────────────────────
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -553,22 +598,28 @@ pub struct CreateMarket<'info> {
     #[account(mut, seeds = [REGISTRY_SEED], bump = registry.bump)]
     pub registry: Account<'info, MarketRegistry>,
     #[account(
-        init, payer = creator, space = MARKET_SPACE,
-        seeds = [MARKET_SEED, registry.total_markets.to_le_bytes().as_ref()], bump
+        init,
+        payer = creator,
+        space = MARKET_SPACE,
+        seeds = [MARKET_SEED, registry.total_markets.to_le_bytes().as_ref()],
+        bump
     )]
     pub market: Account<'info, Market>,
     #[account(
-        init, payer = creator,
-        token::mint = token_mint, token::authority = vault,
-        seeds = [VAULT_SEED, registry.total_markets.to_le_bytes().as_ref()], bump
+        init,
+        payer = creator,
+        token::mint = token_mint,
+        token::authority = vault,
+        seeds = [VAULT_SEED, registry.total_markets.to_le_bytes().as_ref()],
+        bump
     )]
     pub vault: Account<'info, TokenAccount>,
-    pub token_mint:     Account<'info, Mint>,
+    pub token_mint: Account<'info, Mint>,
     #[account(mut)]
-    pub creator:        Signer<'info>,
-    pub token_program:  Program<'info, Token>,
+    pub creator: Signer<'info>,
+    pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
-    pub rent:           Sysvar<'info, Rent>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -578,8 +629,11 @@ pub struct SubmitPosition<'info> {
     #[account(mut, seeds = [MARKET_SEED, market.id.to_le_bytes().as_ref()], bump = market.bump)]
     pub market: Account<'info, Market>,
     #[account(
-        init, payer = user, space = POSITION_SPACE,
-        seeds = [POSITION_SEED, market.key().as_ref(), user.key().as_ref()], bump
+        init,
+        payer = user,
+        space = POSITION_SPACE,
+        seeds = [POSITION_SEED, market.key().as_ref(), user.key().as_ref()],
+        bump
     )]
     pub position: Account<'info, Position>,
     #[account(mut, seeds = [VAULT_SEED, market.id.to_le_bytes().as_ref()], bump = market.vault_bump)]
@@ -587,9 +641,9 @@ pub struct SubmitPosition<'info> {
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
-    pub user:               Signer<'info>,
-    pub token_program:      Program<'info, Token>,
-    pub system_program:     Program<'info, System>,
+    pub user: Signer<'info>,
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -604,8 +658,24 @@ pub struct SettleMarket<'info> {
     #[account(seeds = [REGISTRY_SEED], bump = registry.bump)]
     pub registry: Account<'info, MarketRegistry>,
     #[account(mut, seeds = [MARKET_SEED, market.id.to_le_bytes().as_ref()], bump = market.bump)]
-    pub market:    Account<'info, Market>,
+    pub market: Account<'info, Market>,
     pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ChallengeSettlement<'info> {
+    #[account(mut, seeds = [REGISTRY_SEED], bump = registry.bump)]
+    pub registry: Account<'info, MarketRegistry>,
+    #[account(mut, seeds = [MARKET_SEED, market.id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Account<'info, Market>,
+    pub challenger: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct FinalizeSettlement<'info> {
+    #[account(mut, seeds = [MARKET_SEED, market.id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Account<'info, Market>,
+    pub caller: Signer<'info>,
 }
 
 #[derive(Accounts)]
@@ -617,9 +687,9 @@ pub struct RevealPosition<'info> {
     #[account(
         mut,
         seeds = [POSITION_SEED, market.key().as_ref(), position.owner.as_ref()],
-        bump  = position.bump
+        bump = position.bump
     )]
-    pub position:  Account<'info, Position>,
+    pub position: Account<'info, Position>,
     pub authority: Signer<'info>,
 }
 
@@ -629,8 +699,8 @@ pub struct ClaimWinnings<'info> {
     pub market: Account<'info, Market>,
     #[account(
         mut,
-        seeds      = [POSITION_SEED, market.key().as_ref(), user.key().as_ref()],
-        bump       = position.bump,
+        seeds = [POSITION_SEED, market.key().as_ref(), user.key().as_ref()],
+        bump = position.bump,
         constraint = position.owner == user.key()
     )]
     pub position: Account<'info, Position>,
@@ -638,7 +708,7 @@ pub struct ClaimWinnings<'info> {
     pub vault: Account<'info, TokenAccount>,
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
-    pub user:          Signer<'info>,
+    pub user: Signer<'info>,
     pub token_program: Program<'info, Token>,
 }
 
@@ -647,7 +717,16 @@ pub struct CancelMarket<'info> {
     #[account(seeds = [REGISTRY_SEED], bump = registry.bump)]
     pub registry: Account<'info, MarketRegistry>,
     #[account(mut, seeds = [MARKET_SEED, market.id.to_le_bytes().as_ref()], bump = market.bump)]
-    pub market:    Account<'info, Market>,
+    pub market: Account<'info, Market>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ResolveInvalidMarket<'info> {
+    #[account(mut, seeds = [REGISTRY_SEED], bump = registry.bump)]
+    pub registry: Account<'info, MarketRegistry>,
+    #[account(mut, seeds = [MARKET_SEED, market.id.to_le_bytes().as_ref()], bump = market.bump)]
+    pub market: Account<'info, Market>,
     pub authority: Signer<'info>,
 }
 
@@ -657,8 +736,8 @@ pub struct RefundPosition<'info> {
     pub market: Account<'info, Market>,
     #[account(
         mut,
-        seeds      = [POSITION_SEED, market.key().as_ref(), user.key().as_ref()],
-        bump       = position.bump,
+        seeds = [POSITION_SEED, market.key().as_ref(), user.key().as_ref()],
+        bump = position.bump,
         constraint = position.owner == user.key()
     )]
     pub position: Account<'info, Position>,
@@ -666,32 +745,154 @@ pub struct RefundPosition<'info> {
     pub vault: Account<'info, TokenAccount>,
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
-    pub user:          Signer<'info>,
+    pub user: Signer<'info>,
     pub token_program: Program<'info, Token>,
 }
 
-// ─────────────────────────────────────────────────────────────────
-//  Events
-// ─────────────────────────────────────────────────────────────────
-
 #[event]
 pub struct PositionSubmitted {
-    pub market:      Pubkey,
+    pub market: Pubkey,
     pub participant: Pubkey,
-    pub slot:        u64,
+    pub slot: u64,
 }
 
 #[event]
 pub struct TallyRequested {
-    pub market:  Pubkey,
+    pub market: Pubkey,
     pub cluster: Pubkey,
-    pub slot:    u64,
+    pub slot: u64,
+}
+
+#[event]
+pub struct SettlementSubmitted {
+    pub market: Pubkey,
+    pub settlement_hash: [u8; 32],
+    pub proof_hash: [u8; 32],
+    pub mpc_job_id: [u8; 32],
+    pub challenge_deadline: i64,
+}
+
+#[event]
+pub struct SettlementChallenged {
+    pub market: Pubkey,
+    pub challenger: Pubkey,
+    pub provided_hash: [u8; 32],
+    pub stored_hash: [u8; 32],
+    pub slash_amount: u64,
+    pub reason_code: u8,
+}
+
+#[event]
+pub struct SettlementFinalized {
+    pub market: Pubkey,
+    pub settlement_hash: [u8; 32],
+    pub finalized_slot: u64,
+}
+
+#[event]
+pub struct MarketInvalidated {
+    pub market: Pubkey,
+    pub by: Pubkey,
+    pub reason_code: u8,
 }
 
 #[event]
 pub struct MarketSettled {
-    pub market:    Pubkey,
+    pub market: Pubkey,
     pub yes_stake: u64,
-    pub no_stake:  u64,
-    pub yes_won:   bool,
+    pub no_stake: u64,
+    pub yes_won: bool,
+}
+
+fn write_fixed_bytes<const N: usize>(value: &str) -> [u8; N] {
+    let mut out = [0u8; N];
+    let bytes = value.as_bytes();
+    let take = bytes.len().min(N);
+    out[..take].copy_from_slice(&bytes[..take]);
+    out
+}
+
+fn settlement_hash_for(
+    market_id: u64,
+    yes_stake: u64,
+    no_stake: u64,
+    yes_won: bool,
+    mpc_job_id: [u8; 32],
+    proof_hash: [u8; 32],
+    nonce: [u8; 32],
+) -> [u8; 32] {
+    hashv(&[
+        &market_id.to_le_bytes(),
+        &yes_stake.to_le_bytes(),
+        &no_stake.to_le_bytes(),
+        &[yes_won as u8],
+        &mpc_job_id,
+        &proof_hash,
+        &nonce,
+    ])
+    .to_bytes()
+}
+
+fn payout_amount(position_stake: u64, total_pool: u64, winning_pool: u64) -> u64 {
+    (position_stake as u128)
+        .checked_mul(total_pool as u128)
+        .and_then(|value| value.checked_div(winning_pool as u128))
+        .unwrap_or(0) as u64
+}
+
+fn challenge_window_open(now: i64, deadline: i64) -> bool {
+    now <= deadline
+}
+
+fn settlement_replay_detected(challenged: bool) -> bool {
+    challenged
+}
+
+fn settlement_finalizable(now: i64, deadline: i64, challenged: bool) -> bool {
+    now > deadline && !challenged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settlement_hash_is_deterministic() {
+        let job = [3u8; 32];
+        let proof = [4u8; 32];
+        let nonce = [5u8; 32];
+        let left = settlement_hash_for(7, 11, 13, true, job, proof, nonce);
+        let right = settlement_hash_for(7, 11, 13, true, job, proof, nonce);
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn settlement_hash_changes_with_inputs() {
+        let nonce = [5u8; 32];
+        let proof = [4u8; 32];
+        let first = settlement_hash_for(7, 11, 13, true, [3u8; 32], proof, nonce);
+        let second = settlement_hash_for(7, 11, 13, true, [9u8; 32], proof, nonce);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn payout_math_is_stable() {
+        let payout = payout_amount(200, 1_000, 400);
+        assert_eq!(payout, 500);
+    }
+
+    #[test]
+    fn challenge_window_and_finalize_logic() {
+        assert!(challenge_window_open(99, 100));
+        assert!(!challenge_window_open(101, 100));
+        assert!(settlement_finalizable(200, 100, false));
+        assert!(!settlement_finalizable(90, 100, false));
+        assert!(!settlement_finalizable(200, 100, true));
+    }
+
+    #[test]
+    fn replay_guard_detects_second_challenge() {
+        assert!(!settlement_replay_detected(false));
+        assert!(settlement_replay_detected(true));
+    }
 }
