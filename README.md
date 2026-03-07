@@ -1,239 +1,103 @@
-# 🔒 Oracle — Private Prediction Markets on Solana × Arcium
+# Oracle - Private Prediction Market (Solana x Arcium)
 
-> **Arcium RTG Bounty Submission** — Prediction/Opinion Markets track
+Oracle is a privacy-focused prediction market prototype where market positions are submitted as encrypted payloads and resolved through a dispute-aware settlement flow.
 
-Prediction markets aggregate collective intelligence — but only when participants reveal their genuine beliefs. On traditional platforms, **public stakes create herding**: users copy popular positions rather than contributing independent analysis, distorting prices and defeating the entire purpose.
+## Current Status
 
-**Oracle** solves this with Arcium's Multi-Party Computation (MPC). Stakes, votes, and resolution inputs remain **fully encrypted on-chain** until settlement. Outcomes are revealed honestly, restoring incentive-compatible participation.
+- Frontend + backend prototype is working.
+- Security-oriented dispute flow is implemented (invalid market path, challenge windows, slashing records).
+- Backend test matrix is implemented and passing (unit + integration + adversarial).
 
----
+## Core Features
 
-## 🎯 What This Project Does
+- Encrypted position submission flow (client-side encrypted payloads)
+- Market categories (Crypto, Football, Politics, Macro, Tech)
+- Market activity + append-only audit log via indexer service
+- Dispute engine with:
+  - Challenge window deadlines
+  - Invalid market resolution metadata
+  - Resolver slashing records
+- Wallet unlock guard before privileged actions (create market, submit position, dispute actions)
 
-Oracle is a fully functional decentralised prediction market where:
+## APIs In Use
 
-| Feature | Traditional Market | Oracle (Arcium) |
-|---|---|---|
-| Stake amount visible | ✅ Anyone can see | ❌ Encrypted (ElGamal) |
-| Vote direction visible | ✅ YES/NO on-chain | ❌ Ciphertext on-chain |
-| Real-time odds | ✅ Manipulatable | ❌ Hidden until settlement |
-| Resolution input | ✅ Oracle can be front-run | ❌ Encrypted until MPC tally |
-| Settlement | Simple summation | Threshold MPC decryption |
+- Solana RPC endpoint
+  - Config: `NEXT_PUBLIC_SOLANA_RPC`
+  - Fallback: `https://api.devnet.solana.com`
+- News API aggregator endpoint (`/api/news/headlines`)
+  - Providers supported: `gnews`, `newsapi`
+  - Config: `NEWS_API_PROVIDER`, `NEWS_API_KEY`
+  - Fallback mode returns static headlines when no API key is set
+- Arcium cluster key fetch (currently mocked in code)
+  - `fetchClusterPublicKey()` currently returns placeholder bytes in `utils/arcium.ts`
 
----
+## Information Verification Model (Recommended)
 
-## 🔐 How Arcium Is Used
+For production settlement integrity, enforce:
 
-### 1. Client-Side Encryption (Before Submission)
+1. Multi-source verification: query at least 2 independent sources per market.
+2. Canonical hashing: store `source_payload_hash + timestamp + source_id` in audit log before resolution.
+3. Source allowlist: accept only approved official sources per category.
+4. Dispute evidence binding: require evidence URI + hash in dispute resolution records.
 
-When a user places a position, their browser:
+## Backend Security Audit (March 7, 2026)
 
-1. Fetches the **Arcium cluster's public key** from the on-chain registry
-2. Generates fresh randomness `r`
-3. Encrypts stake amount `m` as an **ElGamal ciphertext**:
-   ```
-   C1 = r · G          (ephemeral public key)
-   C2 = m · G + r · PK  (blinded message)
-   ```
-4. Encrypts YES/NO choice with the same scheme
-5. Only the ciphertexts `(C1, C2)` are submitted to Solana
+### Standard Checks Executed
 
-**The plaintext never touches the blockchain.**
+- Dependency vulnerability scan: `npm audit --omit=dev --audit-level=moderate`
+- Type safety pass: `npx tsc --noEmit`
+- Backend test matrix: `npm run test:matrix`
+- Secret pattern scan (repo): no matches found
+- Dangerous API scan (`eval`, dynamic function execution, shell exec patterns): no matches found in app source
 
-### 2. Homomorphic Accumulation (During Market)
+### Test Results
 
-Arcium nodes monitor the Solana program for `PositionSubmitted` events. As positions arrive, they homomorphically accumulate ciphertexts:
+- `test:unit`: pass (3/3)
+- `test:integration`: pass (2/2)
+- `test:adversarial`: pass (3/3)
+- Type check: pass
 
-```
-Σ(C1) = Σ(r_i) · G
-Σ(C2) = Σ(m_i) · G + Σ(r_i) · PK
-```
+### Vulnerability Findings
 
-This is valid because ElGamal encryption over Ristretto255 is **additively homomorphic** — encrypted values can be summed without decryption.
+- `npm audit` reports **1 critical vulnerability** in `next` (current pinned line includes affected versions).
+- Suggested fix from audit: upgrade to patched Next release (e.g., `14.2.35` or later in the 14.x line).
 
-### 3. Threshold MPC Decryption (At Settlement)
+### Cybersecurity Rating
 
-After `resolution_timestamp`, anyone triggers `request_tally()`. The Arcium cluster:
+Current backend security rating: **68 / 100**
 
-1. Each of `n` MPC nodes holds a **key share** `sk_i` such that `Σ sk_i = sk`
-2. A threshold `t` of nodes compute partial decryptions: `D_i = sk_i · C1`
-3. The partial decryptions are combined: `m · G = C2 - Σ D_i`
-4. The result is posted on-chain via the Arcium relayer
+Rationale:
 
-**No single node can decrypt alone.** Quorum is required. This prevents the market operator, Arcium employees, or any single party from learning the tally before settlement.
+- Strong points:
+  - Challenge/slashing dispute controls
+  - Invalid market path with metadata
+  - Passing adversarial tests
+  - No obvious hardcoded secrets or dangerous runtime APIs in backend source
+- Score reducers:
+  - Critical dependency finding in `next`
+  - Arcium key retrieval is still mocked (not a production trust path)
+  - No automated CI gating yet for `npm audit`/SAST/secret scan
 
-### 4. Per-Position Reveal
+## Immediate Remediation Priorities
 
-After market settlement, individual positions are also decrypted by the Arcium cluster, enabling proportional payout calculation. Each user's stake and choice are revealed only at claim time.
+1. Upgrade `next` to a patched non-vulnerable release and re-run `npm audit`.
+2. Replace mocked Arcium key fetch with authenticated cluster key retrieval + signature verification.
+3. Add CI security gates:
+   - `npm audit --audit-level=high`
+   - secret scan
+   - static analysis
+   - required pass for `test:matrix`
 
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                    SOLANA ON-CHAIN                       │
-│                                                         │
-│  MarketRegistry ──► Market ──► Position (per user)      │
-│       │               │             │                   │
-│  arcium_cluster    vault PDA    encrypted_stake (C1,C2) │
-│                               encrypted_choice (C1,C2)  │
-│                                                         │
-└──────────────────────────┬──────────────────────────────┘
-                           │ Events / CPI
-┌──────────────────────────▼──────────────────────────────┐
-│                 ARCIUM MXE CLUSTER                       │
-│                                                         │
-│  Node 1 (sk_1) ─┐                                       │
-│  Node 2 (sk_2) ─┼──► Threshold MPC ──► Decrypt Result  │
-│  Node N (sk_N) ─┘                          │            │
-│                                            ▼            │
-│                                      Arcium Relayer     │
-└──────────────────────────┬──────────────────────────────┘
-                           │ settle_market() CPI
-┌──────────────────────────▼──────────────────────────────┐
-│              SETTLEMENT ON-CHAIN                         │
-│  revealed_yes_stake, revealed_no_stake, outcome          │
-│  → Winners claim proportional payouts from vault         │
-└─────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📁 Project Structure
-
-```
-oracle/
-├── programs/
-│   └── prediction-market/
-│       └── src/
-│           └── lib.rs          # Anchor smart contract (Solana program)
-├── app/
-│   ├── components/
-│   │   ├── Navbar.tsx
-│   │   └── MarketCard.tsx
-│   ├── pages/
-│   │   ├── index.tsx           # Market listing
-│   │   ├── market/[id].tsx     # Market detail + position submission
-│   │   ├── create/index.tsx    # Create new market
-│   │   └── how-it-works/      # Arcium flow explainer
-│   ├── utils/
-│   │   ├── arcium.ts           # Client-side encryption utilities
-│   │   └── program.ts          # Anchor client helpers & PDAs
-│   └── styles/globals.css
-├── tests/
-│   └── prediction-market.ts   # Anchor integration tests
-├── scripts/
-│   └── setup.sh               # One-command full setup
-├── Anchor.toml
-└── README.md
-```
-
----
-
-## 🚀 Quick Start (From Scratch)
-
-### Prerequisites
-
-The setup script installs everything automatically:
+## Useful Commands
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/oracle
-cd oracle
-chmod +x scripts/setup.sh
-./scripts/setup.sh
-```
-
-This installs: Rust, Solana CLI, Anchor CLI, Node.js, and configures a devnet wallet with an SOL airdrop.
-
-### Manual Setup
-
-If you prefer to install manually:
-
-```bash
-# 1. Install Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# 2. Install Solana CLI
-sh -c "$(curl -sSfL https://release.solana.com/v1.18.22/install)"
-solana config set --url https://api.devnet.solana.com
-
-# 3. Create wallet & airdrop
-solana-keygen new
-solana airdrop 4
-
-# 4. Install Anchor
-cargo install --git https://github.com/coral-xyz/anchor avm --locked
-avm install 0.30.1 && avm use 0.30.1
-
-# 5. Build & deploy
-anchor build
-anchor deploy
-
-# 6. Start frontend
-cd app
-npm install
 npm run dev
+npm run build
+npm run test:matrix
+npm run audit:backend
+npx tsc --noEmit
 ```
 
-### Connect Phantom Wallet
+## License
 
-1. Install [Phantom](https://phantom.app)
-2. Settings → Developer Settings → **Change Network → Devnet**
-3. Visit `http://localhost:3000` and connect
-
----
-
-## 🧪 Running Tests
-
-```bash
-anchor test
-```
-
-Tests cover:
-- Protocol initialisation with Arcium cluster assignment
-- Market creation with future resolution timestamp
-- Encrypted position submission (ciphertexts stored, not plaintext)
-- Tally request and settlement flow
-
----
-
-## 🔑 Key Program Instructions
-
-| Instruction | Description |
-|---|---|
-| `initialize` | Deploy registry, assign Arcium cluster |
-| `create_market` | Create a new prediction market |
-| `submit_position` | Submit encrypted (stake, choice) ciphertexts |
-| `request_tally` | Lock market, emit Arcium MPC job request |
-| `settle_market` | Receive MPC result, reveal outcome |
-| `reveal_position` | Arcium reveals per-position decryption |
-| `claim_winnings` | Winner claims proportional payout from vault |
-
----
-
-## 🌐 Privacy Benefits Summary
-
-1. **No Herding** — Users can't see others' positions, eliminating copycat behaviour
-2. **No Frontrunning** — Resolution inputs are encrypted; oracles cannot manipulate settlement
-3. **No Market Manipulation** — Whale positions are invisible; no one can trigger liquidations by tracking large stakes
-4. **Genuine Price Discovery** — Odds are hidden until settlement, forcing participants to submit based on true beliefs
-5. **Non-custodial** — All funds in Solana PDAs; only the program logic can release them
-
----
-
-## 📄 License
-
-MIT — Open Source
-
----
-
-## 🙏 Credits
-
-- [Arcium](https://arcium.com) — MPC privacy layer
-- [Anchor](https://www.anchor-lang.com) — Solana smart contract framework
-- [Solana](https://solana.com) — High-throughput blockchain
-
-*Built for the Arcium RTG Bounty — Prediction Markets track*
-
-
+MIT
