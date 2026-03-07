@@ -36,6 +36,7 @@ import {
   type ProbabilityHistoryPoint,
   type SettlementDisputeRecord,
 } from "../../utils/api";
+import { ensureWalletUnlocked } from "../../utils/wallet-guard";
 
 type StepState = "idle" | "encrypting" | "submitting" | "confirmed" | "error";
 
@@ -57,6 +58,7 @@ function activityLabel(type: string): string {
     DISPUTE_OPENED: "Dispute opened",
     DISPUTE_EVIDENCE_ADDED: "Evidence added",
     DISPUTE_RESOLVED: "Dispute resolved",
+    DISPUTE_SLASHED: "Resolver slashed",
     MARKET_STATUS_CHANGED: "Status changed",
   };
   return labels[type] ?? type;
@@ -114,7 +116,8 @@ function ProbabilityChart({ points }: { points: ProbabilityHistoryPoint[] }) {
 
 export default function MarketPage() {
   const router = useRouter();
-  const { connected, publicKey } = useWallet();
+  const wallet = useWallet();
+  const { connected, publicKey } = wallet;
   const [choice, setChoice] = useState<"yes" | "no" | null>(null);
   const [stakeInput, setStakeInput] = useState("");
   const [step, setStep] = useState<StepState>("idle");
@@ -205,9 +208,11 @@ export default function MarketPage() {
     if (Number.isNaN(stakeSOL) || stakeSOL <= 0) return;
 
     setError(null);
-    setStep("encrypting");
 
     try {
+      await ensureWalletUnlocked(wallet, "submit an encrypted position");
+      setStep("encrypting");
+
       const clusterKey = await fetchClusterPublicKey(ARCIUM_DEVNET_CLUSTER);
       const stakeLamports = BigInt(Math.floor(stakeSOL * 1e9));
       const encStake = encryptStake(stakeLamports, clusterKey);
@@ -253,6 +258,7 @@ export default function MarketPage() {
     setDisputeError(null);
 
     try {
+      await ensureWalletUnlocked(wallet, "open a dispute");
       const response = await fetch(`/api/markets/${market.id}/disputes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -278,12 +284,16 @@ export default function MarketPage() {
   async function handleResolveDispute(disputeId: string, outcome: "MarketInvalid" | "SettlementUpheld") {
     if (!connected || !publicKey) return;
     try {
+      await ensureWalletUnlocked(wallet, "resolve a dispute");
       const response = await fetch(`/api/disputes/${disputeId}/resolve`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           wallet: publicKey.toBase58(),
           outcome,
+          invalidReasonCode:
+            outcome === "MarketInvalid" ? "ORACLE_DATA_MISMATCH" : undefined,
+          slashBps: outcome === "MarketInvalid" ? 500 : undefined,
           resolutionNote:
             outcome === "MarketInvalid"
               ? "Invalid criteria confirmed by challenger evidence."
@@ -561,6 +571,21 @@ export default function MarketPage() {
                       <p className="mt-1 font-mono text-[10px] text-slate-500">
                         {dispute.evidence.length} evidence item{dispute.evidence.length === 1 ? "" : "s"}
                       </p>
+                      {dispute.challengeWindow ? (
+                        <p className="mt-1 font-mono text-[10px] text-slate-500">
+                          Challenge deadline: {format(dispute.challengeWindow.deadlineAt, "MMM d, HH:mm")}
+                        </p>
+                      ) : null}
+                      {dispute.invalidResolution ? (
+                        <p className="mt-1 font-mono text-[10px] text-amber-300">
+                          Invalid path: {dispute.invalidResolution.reasonCode}
+                        </p>
+                      ) : null}
+                      {dispute.slashing ? (
+                        <p className="mt-1 font-mono text-[10px] text-rose-300">
+                          Slashed {dispute.slashing.slashAmountSol.toFixed(4)} SOL ({dispute.slashing.slashBps} bps)
+                        </p>
+                      ) : null}
                       {connected && dispute.status === "Open" ? (
                         <div className="mt-2 flex gap-2">
                           <button
