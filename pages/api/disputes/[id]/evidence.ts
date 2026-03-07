@@ -1,9 +1,25 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { normalizeWallet, store } from "../../../../lib/server/store";
+import type { EvidenceSourceType } from "../../../../lib/server/services/dispute-engine";
+
+const EVIDENCE_SOURCE_TYPES: EvidenceSourceType[] = [
+  "OfficialRecord",
+  "MarketDataAPI",
+  "NewsArticle",
+  "OnChainEvent",
+  "Other",
+];
 
 function parseDisputeId(value: string | string[] | undefined): string {
   const raw = Array.isArray(value) ? value[0] : value;
   return raw ?? "";
+}
+
+function parseEvidenceSourceType(value: unknown): EvidenceSourceType | undefined {
+  if (typeof value !== "string") return undefined;
+  return EVIDENCE_SOURCE_TYPES.includes(value as EvidenceSourceType)
+    ? (value as EvidenceSourceType)
+    : undefined;
 }
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -17,6 +33,9 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   const submittedBy = normalizeWallet(req.body?.wallet);
   const summary = typeof req.body?.summary === "string" ? req.body.summary.trim() : "";
   const uri = typeof req.body?.uri === "string" ? req.body.uri.trim() : "";
+  const sourceType = parseEvidenceSourceType(req.body?.sourceType);
+  const sourceDomain =
+    typeof req.body?.sourceDomain === "string" ? req.body.sourceDomain.trim() : "";
 
   if (!disputeId) {
     res.status(400).json({ error: "Dispute id is required." });
@@ -26,6 +45,10 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     res.status(400).json({ error: "Evidence summary must be at least 8 characters." });
     return;
   }
+  if (uri && !/^https?:\/\//i.test(uri)) {
+    res.status(400).json({ error: "Evidence URI must start with http:// or https://." });
+    return;
+  }
 
   try {
     const dispute = store.addDisputeEvidence({
@@ -33,6 +56,8 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       submittedBy,
       summary,
       uri: uri || undefined,
+      sourceType,
+      sourceDomain: sourceDomain || undefined,
     });
 
     res.status(200).json({
