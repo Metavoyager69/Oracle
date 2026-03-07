@@ -40,6 +40,23 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
         ...dispute,
         createdAt: dispute.createdAt.toISOString(),
         updatedAt: dispute.updatedAt.toISOString(),
+        challengeWindow: {
+          openedAt: dispute.challengeWindow.openedAt.toISOString(),
+          deadlineAt: dispute.challengeWindow.deadlineAt.toISOString(),
+          closedAt: dispute.challengeWindow.closedAt?.toISOString(),
+        },
+        slashing: dispute.slashing
+          ? {
+              ...dispute.slashing,
+              appliedAt: dispute.slashing.appliedAt.toISOString(),
+            }
+          : undefined,
+        invalidResolution: dispute.invalidResolution
+          ? {
+              ...dispute.invalidResolution,
+              decidedAt: dispute.invalidResolution.decidedAt.toISOString(),
+            }
+          : undefined,
         evidence: dispute.evidence.map((item) => ({
           ...item,
           createdAt: item.createdAt.toISOString(),
