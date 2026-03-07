@@ -69,6 +69,12 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       res.status(400).json({ error: "Resolution source is required and must be 160 chars or less." });
       return;
     }
+    if (rules.length < 2) {
+      res.status(400).json({
+        error: "Provide at least 2 explicit settlement rules for a clear market contract.",
+      });
+      return;
+    }
     if (Number.isNaN(resolutionTimestamp.getTime()) || resolutionTimestamp.getTime() <= Date.now()) {
       res.status(400).json({ error: "Resolution timestamp must be a valid future date." });
       return;
@@ -80,14 +86,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       category,
       resolutionTimestamp,
       resolutionSource,
-      rules:
-        rules.length > 0
-          ? rules
-          : [
-              "Primary source listed in market metadata is authoritative.",
-              "If source is unavailable, predefined fallback source applies.",
-              "Final settlement is published after Arcium MPC verification.",
-            ],
+      rules,
       creatorWallet,
     });
 
