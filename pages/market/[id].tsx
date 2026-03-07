@@ -9,7 +9,6 @@ import Navbar from "../../components/Navbar";
 import {
   CATEGORY_STYLES,
   DEMO_MARKETS,
-  DEMO_POSITIONS,
   calculatePositionPnl,
   type DemoMarket,
   type DemoPosition,
@@ -131,7 +130,12 @@ export default function MarketPage() {
   const [disputes, setDisputes] = useState<SettlementDisputeRecord[]>([]);
   const [disputeReason, setDisputeReason] = useState("");
   const [evidenceSummary, setEvidenceSummary] = useState("");
+  const [evidenceUri, setEvidenceUri] = useState("");
+  const [evidenceSourceType, setEvidenceSourceType] = useState<
+    "OfficialRecord" | "MarketDataAPI" | "NewsArticle" | "OnChainEvent" | "Other"
+  >("Other");
   const [disputeError, setDisputeError] = useState<string | null>(null);
+  const [historyScope, setHistoryScope] = useState<"wallet" | "wallet_required">("wallet_required");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -175,19 +179,19 @@ export default function MarketPage() {
             deserializeSettlementDispute(item)
           )
         : [];
+      const fetchedHistoryScope = payload?.historyScope === "wallet" ? "wallet" : "wallet_required";
 
       setMarket(deserializeMarket(marketItem));
       setHistory(historyItems);
+      setHistoryScope(fetchedHistoryScope);
       setProbabilityHistory(probabilityItems);
       setActivity(activityItems);
       setDisputes(disputeItems);
     } catch (caught) {
       const fallbackMarket = DEMO_MARKETS.find((item) => item.id === marketId) ?? null;
-      const fallbackHistory = DEMO_POSITIONS.filter((item) => item.marketId === marketId).sort(
-        (left, right) => right.submittedAt.getTime() - left.submittedAt.getTime()
-      );
       setMarket(fallbackMarket);
-      setHistory(fallbackHistory);
+      setHistory([]);
+      setHistoryScope("wallet_required");
       setProbabilityHistory([]);
       setActivity([]);
       setDisputes([]);
@@ -259,6 +263,15 @@ export default function MarketPage() {
 
     try {
       await ensureWalletUnlocked(wallet, "open a dispute");
+      const sourceDomain = evidenceUri
+        ? (() => {
+            try {
+              return new URL(evidenceUri).hostname;
+            } catch {
+              return undefined;
+            }
+          })()
+        : undefined;
       const response = await fetch(`/api/markets/${market.id}/disputes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -266,6 +279,9 @@ export default function MarketPage() {
           wallet: publicKey.toBase58(),
           reason: disputeReason,
           evidenceSummary: evidenceSummary,
+          evidenceUri: evidenceUri || undefined,
+          evidenceSourceType,
+          evidenceSourceDomain: sourceDomain,
         }),
       });
       const payload = await response.json();
@@ -274,6 +290,8 @@ export default function MarketPage() {
       }
       setDisputeReason("");
       setEvidenceSummary("");
+      setEvidenceUri("");
+      setEvidenceSourceType("Other");
       await fetchMarketData();
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "Unknown dispute error.";
@@ -468,14 +486,22 @@ export default function MarketPage() {
               </ul>
             </div>
 
-            {history.length > 0 ? (
-              <div className="card p-6">
-                <div className="mb-4 flex items-center justify-between">
-                  <h2 className="font-mono text-xs tracking-widest text-violet-300">POSITION HISTORY</h2>
-                  <Link href="/portfolio" className="font-mono text-xs text-cyan-400">
-                    VIEW ALL
-                  </Link>
-                </div>
+            <div className="card p-6">
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="font-mono text-xs tracking-widest text-violet-300">POSITION HISTORY</h2>
+                <Link href="/portfolio" className="font-mono text-xs text-cyan-400">
+                  VIEW ALL
+                </Link>
+              </div>
+              {!connected || historyScope !== "wallet" ? (
+                <p className="font-mono text-xs text-slate-500">
+                  Connect wallet to view your private position history for this market.
+                </p>
+              ) : history.length === 0 ? (
+                <p className="font-mono text-xs text-slate-500">
+                  No wallet-scoped positions in this market yet.
+                </p>
+              ) : (
                 <div className="space-y-3">
                   {history.map((position) => {
                     const pnl = calculatePositionPnl(position);
@@ -505,8 +531,8 @@ export default function MarketPage() {
                     );
                   })}
                 </div>
-              </div>
-            ) : null}
+              )}
+            </div>
           </div>
 
           <div>
@@ -548,6 +574,32 @@ export default function MarketPage() {
                     placeholder="Evidence summary (optional)"
                     className="mb-3 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none"
                   />
+                  <input
+                    value={evidenceUri}
+                    onChange={(event) => setEvidenceUri(event.target.value)}
+                    placeholder="Evidence URI (https://...)"
+                    className="mb-3 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none"
+                  />
+                  <select
+                    value={evidenceSourceType}
+                    onChange={(event) =>
+                      setEvidenceSourceType(
+                        event.target.value as
+                          | "OfficialRecord"
+                          | "MarketDataAPI"
+                          | "NewsArticle"
+                          | "OnChainEvent"
+                          | "Other"
+                      )
+                    }
+                    className="mb-3 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none"
+                  >
+                    <option value="Other">Other evidence source</option>
+                    <option value="OfficialRecord">Official record</option>
+                    <option value="MarketDataAPI">Market data API</option>
+                    <option value="NewsArticle">News article</option>
+                    <option value="OnChainEvent">On-chain event</option>
+                  </select>
                   {disputeError ? <p className="mb-3 font-mono text-xs text-rose-300">{disputeError}</p> : null}
                   <button onClick={handleOpenDispute} className="btn-secondary w-full">
                     OPEN DISPUTE
@@ -571,6 +623,16 @@ export default function MarketPage() {
                       <p className="mt-1 font-mono text-[10px] text-slate-500">
                         {dispute.evidence.length} evidence item{dispute.evidence.length === 1 ? "" : "s"}
                       </p>
+                      <p className="mt-1 font-mono text-[10px] text-slate-500">
+                        Verified{" "}
+                        {dispute.evidence.filter((item) => item.verificationStatus === "Verified").length} /
+                        {dispute.evidence.length}
+                      </p>
+                      {dispute.evidence[0]?.evidenceHash ? (
+                        <p className="mt-1 font-mono text-[10px] text-slate-500">
+                          Evidence hash: {dispute.evidence[0].evidenceHash.slice(0, 14)}...
+                        </p>
+                      ) : null}
                       {dispute.challengeWindow ? (
                         <p className="mt-1 font-mono text-[10px] text-slate-500">
                           Challenge deadline: {format(dispute.challengeWindow.deadlineAt, "MMM d, HH:mm")}
