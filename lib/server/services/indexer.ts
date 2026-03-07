@@ -8,6 +8,7 @@ export type IndexerEventType =
   | "DISPUTE_OPENED"
   | "DISPUTE_EVIDENCE_ADDED"
   | "DISPUTE_RESOLVED"
+  | "DISPUTE_SLASHED"
   | "MARKET_STATUS_CHANGED";
 
 export interface IndexerEventRecord {
