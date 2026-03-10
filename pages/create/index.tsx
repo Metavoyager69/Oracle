@@ -7,6 +7,7 @@ import Navbar from "../../components/Navbar";
 import { MARKET_CATEGORIES, type MarketCategory } from "../../utils/program";
 import { ensureWalletUnlocked } from "../../utils/wallet-guard";
 
+// Create page aims to keep market rules explicit and auditable before launch.
 export default function CreateMarket() {
   const wallet = useWallet();
   const { connected, publicKey } = wallet;
@@ -21,6 +22,7 @@ export default function CreateMarket() {
   const [step, setStep] = useState<"idle" | "submitting" | "done" | "error">("idle");
   const [error, setError] = useState<string | null>(null);
 
+  // Parse plain-text rules into a clean bounded list.
   const parsedRules = rulesInput
     .split("\n")
     .map((line) => line.trim())
@@ -36,6 +38,7 @@ export default function CreateMarket() {
 
     setError(null);
     if (!hasMinimumRules) {
+      // Nontechnical requirement: every market must include clear, testable rules.
       setError("Add at least 2 clear settlement rules before creating this market.");
       return;
     }

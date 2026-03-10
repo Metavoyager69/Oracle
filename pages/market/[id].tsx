@@ -37,6 +37,7 @@ import {
 } from "../../utils/api";
 import { ensureWalletUnlocked } from "../../utils/wallet-guard";
 
+// Market detail page: combines trading UI, privacy-safe activity, and dispute actions.
 type StepState = "idle" | "encrypting" | "submitting" | "confirmed" | "error";
 
 function toHex(bytes: Uint8Array): string {
@@ -183,6 +184,7 @@ export default function MarketPage() {
 
       setMarket(deserializeMarket(marketItem));
       setHistory(historyItems);
+      // Server decides whether this user may view history (wallet-scoped only).
       setHistoryScope(fetchedHistoryScope);
       setProbabilityHistory(probabilityItems);
       setActivity(activityItems);

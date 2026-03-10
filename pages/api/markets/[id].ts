@@ -2,6 +2,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { serializeMarket, serializePosition } from "../../../utils/api";
 import { normalizeWallet, store } from "../../../lib/server/store";
 
+// API endpoint: returns one market plus related chart/activity/dispute data.
+// Important privacy rule: position history is wallet-scoped only.
 function parseId(value: string | string[] | undefined): number {
   const raw = Array.isArray(value) ? value[0] : value;
   if (!raw) return Number.NaN;
@@ -29,6 +31,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
 
   const walletScope = req.query.wallet ? normalizeWallet(req.query.wallet) : undefined;
   const hasWalletScope = Boolean(walletScope && walletScope !== "demo_wallet");
+  // Without a valid wallet, history is intentionally hidden.
   const history = hasWalletScope
     ? store
         .listPositions({ marketId: id, wallet: walletScope })

@@ -23,6 +23,8 @@ import {
   type IndexerReconcileReport,
 } from "./services/indexer";
 
+// OracleStore is the central in-memory backend coordinator.
+// It ties together markets, positions, disputes, and audit/indexer events.
 const DEMO_WALLET = "demo_wallet";
 const WALLET_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const SEEDED_WALLETS = [
@@ -98,6 +100,7 @@ export class OracleStore {
     this.seedIndexerAndTelemetry();
   }
 
+  // Lists markets with optional filters used by the main discovery page.
   listMarkets(filters: ListMarketFilters = {}): DemoMarket[] {
     const { status, category, search } = filters;
     const normalizedSearch = search?.trim().toLowerCase();
@@ -123,6 +126,7 @@ export class OracleStore {
     return market ? cloneMarket(market) : null;
   }
 
+  // Creates a new market and emits an indexer event so observers can track it.
   createMarket(input: CreateMarketInput): DemoMarket {
     const id = this.nextMarketId++;
     const now = new Date();
@@ -174,6 +178,7 @@ export class OracleStore {
     return cloneMarket(market);
   }
 
+  // Returns positions, optionally narrowed to one market and/or one wallet.
   listPositions(filters: ListPositionFilters = {}): DemoPosition[] {
     const { marketId, wallet } = filters;
     const normalizedWallet = wallet ? normalizeWallet(wallet) : undefined;
@@ -188,6 +193,7 @@ export class OracleStore {
       .map(clonePosition);
   }
 
+  // Accepts a new private position and logs a redacted activity event.
   submitPosition(input: SubmitPositionInput): { position: DemoPosition; txSig: string } {
     const market = this.markets.find((item) => item.id === input.marketId);
     if (!market) {
@@ -241,6 +247,7 @@ export class OracleStore {
     };
   }
 
+  // Returns wallet-scoped positions plus computed PnL summary metrics.
   getPortfolio(wallet: string): {
     positions: DemoPosition[];
     summary: ReturnType<typeof getPortfolioSummary>;
@@ -257,19 +264,23 @@ export class OracleStore {
     };
   }
 
+  // Market timeline chart data for probability/price history visualization.
   getMarketProbabilityHistory(marketId: number, limit = 64): ProbabilityHistoryPoint[] {
     const points = this.probabilityByMarket.get(marketId) ?? [];
     return points.slice(-Math.max(1, limit)).map(cloneProbabilityPoint);
   }
 
+  // Public activity feed for a market (already privacy-redacted).
   getMarketActivity(marketId: number, limit = 50): IndexerEventRecord[] {
     return this.indexer.listMarketActivity(marketId, limit);
   }
 
+  // Dispute APIs consume this market-scoped list.
   listMarketDisputes(marketId: number): SettlementDisputeRecord[] {
     return this.disputeEngine.listDisputes(marketId);
   }
 
+  // Opens a dispute and computes stake-at-risk used for slashing math.
   openMarketDispute(input: OpenDisputeInput): SettlementDisputeRecord {
     const market = this.markets.find((item) => item.id === input.marketId);
     if (!market) {
@@ -300,6 +311,7 @@ export class OracleStore {
     return dispute;
   }
 
+  // Adds extra evidence to an existing open dispute.
   addDisputeEvidence(input: AddEvidenceInput): SettlementDisputeRecord {
     const dispute = this.disputeEngine.addEvidence(input);
     this.indexer.consumeEvent({
@@ -312,6 +324,7 @@ export class OracleStore {
     return dispute;
   }
 
+  // Resolves dispute and mirrors the outcome back onto market status/timeline.
   resolveDispute(input: ResolveDisputeInput): SettlementDisputeRecord {
     const dispute = this.disputeEngine.resolveDispute(input);
     this.indexer.consumeEvent({
@@ -350,10 +363,12 @@ export class OracleStore {
     return dispute;
   }
 
+  // Append-only audit records used for compliance and post-incident reviews.
   getAuditLog(limit = 200): AuditLogRecord[] {
     return this.indexer.listAuditLog(limit);
   }
 
+  // Health report: compares indexer view against market/dispute current state.
   reconcileIndexerState(): IndexerReconcileReport {
     return this.indexer.reconcileState(
       this.markets.map((market) => ({ id: market.id, status: market.status })),
@@ -436,6 +451,7 @@ export class OracleStore {
     return clamp(Number((base + jitter).toFixed(2)), 0.05, 0.95);
   }
 
+  // Seeds startup telemetry so UI pages have immediate chart/activity content.
   private seedIndexerAndTelemetry() {
     const seedEvents: Array<{
       marketId: number;
@@ -489,6 +505,7 @@ export class OracleStore {
     }
   }
 
+  // Rebuilds chart points whenever position activity changes.
   private rebuildProbabilityHistory(marketId: number) {
     const market = this.markets.find((item) => item.id === marketId);
     if (!market) return;

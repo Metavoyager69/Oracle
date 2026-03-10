@@ -1,5 +1,8 @@
 import { createHash, randomBytes } from "crypto";
 
+// This service is the "rulebook engine" for settlement disputes.
+// It keeps an in-memory record of disputes, enforces challenge deadlines,
+// and records whether a resolver should be slashed when a challenge succeeds.
 const DEFAULT_CHALLENGE_WINDOW_HOURS = 24;
 const DEFAULT_SLASH_BPS = 500;
 const MIN_SLASH_BPS = 50;
@@ -117,6 +120,8 @@ export class SettlementDisputeEngine {
   private disputes: SettlementDisputeRecord[] = [];
   private nextDisputeId = 1;
 
+  // Returns all disputes (or disputes for one market), and auto-expires
+  // records that stayed open past their challenge deadline.
   listDisputes(marketId?: number): SettlementDisputeRecord[] {
     this.expireDisputes();
     const filtered =
@@ -132,6 +137,8 @@ export class SettlementDisputeEngine {
     return dispute ? cloneDispute(dispute) : null;
   }
 
+  // Opens a new dispute ticket with optional initial evidence.
+  // The challenge window is started immediately.
   openDispute(input: OpenDisputeInput): SettlementDisputeRecord {
     const now = input.now ? new Date(input.now) : new Date();
     const challengeWindowHours = clampInt(
@@ -181,6 +188,8 @@ export class SettlementDisputeEngine {
     return cloneDispute(dispute);
   }
 
+  // Adds a new evidence item while the dispute is still open.
+  // Evidence gets a hash and verification status for traceability.
   addEvidence(input: AddEvidenceInput): SettlementDisputeRecord {
     const dispute = this.disputes.find((item) => item.id === input.disputeId);
     if (!dispute) {
@@ -208,6 +217,8 @@ export class SettlementDisputeEngine {
     return cloneDispute(dispute);
   }
 
+  // Applies the final dispute decision.
+  // Successful challenge outcomes can trigger slashing metadata.
   resolveDispute(input: ResolveDisputeInput): SettlementDisputeRecord {
     const now = input.now ? new Date(input.now) : new Date();
     this.expireDisputes(now);
@@ -265,6 +276,7 @@ export class SettlementDisputeEngine {
     return cloneDispute(dispute);
   }
 
+  // Marks stale open disputes as expired once their deadline passes.
   expireDisputes(reference = new Date()): number {
     let expiredCount = 0;
     for (const dispute of this.disputes) {
@@ -334,6 +346,7 @@ function roundToSix(value: number): number {
 }
 
 function evidenceHashFor(summary: string, uri: string | undefined, createdAt: Date): string {
+  // Hash acts like a tamper-evident fingerprint for the evidence item.
   return createHash("sha256")
     .update(summary.trim().toLowerCase())
     .update("|")
@@ -358,6 +371,10 @@ function deriveVerificationStatus(
   uri: string | undefined,
   sourceDomain: string | undefined
 ): EvidenceVerificationStatus {
+  // Simple trust heuristic:
+  // - no URI => pending manual review
+  // - non-HTTPS => rejected
+  // - HTTPS + valid source domain => verified
   if (!uri) return "Pending";
   const isHttps = /^https:\/\//i.test(uri);
   if (!isHttps) return "Rejected";
