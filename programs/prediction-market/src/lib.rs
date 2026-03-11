@@ -2,34 +2,24 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::hash::hashv;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-// Unique ID for our Prediction Market program on the Solana blockchain.
 declare_id!("PredMkt1111111111111111111111111111111111111");
 
-// Standard "Seeds" used to find our program's private data folders (PDAs).
 pub const MARKET_SEED: &[u8] = b"market";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const POSITION_SEED: &[u8] = b"position";
 pub const REGISTRY_SEED: &[u8] = b"registry";
 
-// Safety limits and protocol settings.
-pub const MIN_STAKE: u64 = 1_000_000;  // Minimum bet amount (1 million lamports).
-pub const MAX_TITLE_LEN: usize = 128;
-pub const MAX_DESC_LEN: usize = 512;
-pub const ORACLE_VOTE_THRESHOLD: u8 = 3; // Number of oracles needed to settle.
-
-// Memory space allocation for Solana accounts.
+pub const MIN_STAKE: u64 = 1_000_000; 
 pub const REGISTRY_SPACE: usize = 8 + 256;
-pub const MARKET_SPACE: usize = 8 + 4096;
+pub const MARKET_SPACE: usize = 8 + 1024; // Optimized space
 pub const POSITION_SPACE: usize = 8 + 256;
 
-/// This structure represents an encrypted message.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Ciphertext {
     pub c1: [u8; 32],
     pub c2: [u8; 32],
 }
 
-/// [SECURITY UPGRADE P1] - ZK-Stake Proof
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default)]
 pub struct ZkStakeProof {
     pub commitment: [u8; 32],
@@ -37,17 +27,15 @@ pub struct ZkStakeProof {
     pub amount: u64,
 }
 
-/// The Main Registry: Stores global settings.
 #[account]
 pub struct MarketRegistry {
     pub authority: Pubkey,
     pub arcium_cluster: Pubkey,
     pub oracle_keys: [Pubkey; 5],
-    pub total_markets: u64,
+    pub total_markets: u64, // FIXED: Now used to assign IDs
     pub bump: u8,
 }
 
-/// A specific Prediction Market.
 #[account]
 pub struct Market {
     pub id: u64,
@@ -55,10 +43,11 @@ pub struct Market {
     pub title: [u8; 128],
     pub description: [u8; 512],
     pub resolution_timestamp: i64,
-    pub arcium_cluster: Pubkey,
     pub status: MarketStatus,
     pub outcome: Option<bool>,
     pub vault: Pubkey,
+    pub total_yes_stake: u64, // FIXED: Track pool for fair payouts
+    pub total_no_stake: u64,  // FIXED: Track pool for fair payouts
     pub yes_votes: u8,
     pub no_votes: u8,
     pub voters: [Pubkey; 5],
@@ -66,21 +55,18 @@ pub struct Market {
     pub vault_bump: u8,
 }
 
-/// The different stages a market can be in.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Default)]
 pub enum MarketStatus {
     #[default] Open, Settled, Cancelled,
 }
 
-/// A user's individual bet (position).
 #[account]
 pub struct Position {
     pub owner: Pubkey,
     pub market: Pubkey,
-    pub encrypted_stake: Ciphertext,
     pub deposited_stake: u64,
     pub claimed: bool,
-    pub choice: bool, // [PHASE 3] Simplified for claiming logic.
+    pub choice: bool,
     pub bump: u8,
 }
 
@@ -94,6 +80,8 @@ pub enum PredictionMarketError {
     #[msg("Market not settled yet")] MarketNotSettled,
     #[msg("Already claimed")] AlreadyClaimed,
     #[msg("You did not win this bet")] DidNotWin,
+    #[msg("Market already settled")] AlreadySettled,
+    #[msg("Event has already occurred")] EventPassed,
 }
 
 #[program]
@@ -105,27 +93,39 @@ pub mod prediction_market {
         registry.authority = ctx.accounts.authority.key();
         registry.arcium_cluster = arcium_cluster;
         registry.oracle_keys = oracles;
+        registry.total_markets = 0; // FIXED: Initialize counter
         registry.bump = ctx.bumps.registry;
         Ok(())
     }
 
     pub fn create_market(ctx: Context<CreateMarket>, title: String, description: String, resolution_timestamp: i64) -> Result<()> {
+        let registry = &mut ctx.accounts.registry;
         let market = &mut ctx.accounts.market;
+        
+        market.id = registry.total_markets; // FIXED: Assign unique ID
         market.creator = ctx.accounts.creator.key();
         market.title = write_fixed_bytes::<128>(&title);
         market.description = write_fixed_bytes::<512>(&description);
         market.resolution_timestamp = resolution_timestamp;
         market.status = MarketStatus::Open;
+        market.total_yes_stake = 0;
+        market.total_no_stake = 0;
         market.yes_votes = 0;
         market.no_votes = 0;
         market.voters = [Pubkey::default(); 5];
         market.bump = ctx.bumps.market;
         market.vault_bump = ctx.bumps.vault;
+
+        registry.total_markets += 1; // FIXED: Increment global counter
         Ok(())
     }
 
-    pub fn submit_position(ctx: Context<SubmitPosition>, encrypted_stake: Ciphertext, zk_proof: ZkStakeProof, choice: bool) -> Result<()> {
+    pub fn submit_position(ctx: Context<SubmitPosition>, _encrypted_stake: Ciphertext, zk_proof: ZkStakeProof, choice: bool) -> Result<()> {
         let market = &mut ctx.accounts.market;
+        let clock = Clock::get()?;
+
+        // FIXED: Block bets after the event timestamp has passed
+        require!(clock.unix_timestamp < market.resolution_timestamp, PredictionMarketError::EventPassed);
         require!(market.status == MarketStatus::Open, PredictionMarketError::MarketNotOpen);
         require!(zk_proof.amount >= MIN_STAKE, PredictionMarketError::StakeTooLow);
 
@@ -142,10 +142,16 @@ pub mod prediction_market {
         );
         token::transfer(cpi_ctx, zk_proof.amount)?;
 
+        // FIXED: Update pool totals
+        if choice {
+            market.total_yes_stake += zk_proof.amount;
+        } else {
+            market.total_no_stake += zk_proof.amount;
+        }
+
         let position = &mut ctx.accounts.position;
         position.owner = ctx.accounts.user.key();
         position.market = market.key();
-        position.encrypted_stake = encrypted_stake;
         position.deposited_stake = zk_proof.amount;
         position.choice = choice;
         position.claimed = false;
@@ -156,6 +162,10 @@ pub mod prediction_market {
     pub fn vote_on_outcome(ctx: Context<SettleMarket>, yes_won: bool) -> Result<()> {
         let registry = &ctx.accounts.registry;
         let market = &mut ctx.accounts.market;
+
+        // FIXED: Don't allow voting on already settled markets
+        require!(market.status == MarketStatus::Open, PredictionMarketError::AlreadySettled);
+
         let oracle_key = ctx.accounts.oracle.key();
         let is_valid_oracle = registry.oracle_keys.iter().any(|&k| k == oracle_key);
         require!(is_valid_oracle, PredictionMarketError::UnauthorizedOracle);
@@ -170,36 +180,35 @@ pub mod prediction_market {
 
         if yes_won { market.yes_votes += 1; } else { market.no_votes += 1; }
 
-        if market.yes_votes >= ORACLE_VOTE_THRESHOLD {
+        if market.yes_votes >= 3 {
             market.outcome = Some(true);
             market.status = MarketStatus::Settled;
-        } else if market.no_votes >= ORACLE_VOTE_THRESHOLD {
+        } else if market.no_votes >= 3 {
             market.outcome = Some(false);
             market.status = MarketStatus::Settled;
         }
         Ok(())
     }
 
-    /// [PHASE 3 UPGRADE] - User Claims Winnings
-    /// Winners can call this to get their prize money after the judges agree on the result.
     pub fn claim_winnings(ctx: Context<ClaimWinnings>) -> Result<()> {
         let market = &ctx.accounts.market;
         let position = &mut ctx.accounts.position;
 
-        // 1. Verify the market is actually finished.
         require!(market.status == MarketStatus::Settled, PredictionMarketError::MarketNotSettled);
-        
-        // 2. Ensure the user hasn't already taken their money.
         require!(!position.claimed, PredictionMarketError::AlreadyClaimed);
 
-        // 3. Confirm the user bet on the winning side.
         let market_outcome = market.outcome.unwrap();
         require!(position.choice == market_outcome, PredictionMarketError::DidNotWin);
 
-        // 4. Calculate the payout. (For now, simplified to double the stake).
-        let payout = position.deposited_stake.saturating_mul(2);
+        // FIXED: Parimutuel Payout logic (Fair pool sharing)
+        // payout = (user_stake / winning_pool) * total_pool
+        let total_pool = market.total_yes_stake + market.total_no_stake;
+        let winning_pool = if market_outcome { market.total_yes_stake } else { market.total_no_stake };
+        
+        let payout = (position.deposited_stake as u128)
+            .checked_mul(total_pool as u128).unwrap()
+            .checked_div(winning_pool as u128).unwrap() as u64;
 
-        // 5. Transfer the money from the vault to the user.
         let market_id_bytes = market.id.to_le_bytes();
         let seeds = &[VAULT_SEED, market_id_bytes.as_ref(), &[market.vault_bump]];
         let signer_seeds = &[&seeds[..]];
@@ -215,7 +224,6 @@ pub mod prediction_market {
         );
         token::transfer(cpi_ctx, payout)?;
 
-        // 6. Mark the ticket as "Used".
         position.claimed = true;
         Ok(())
     }
