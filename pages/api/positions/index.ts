@@ -2,6 +2,9 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { serializePosition } from "../../../utils/api";
 import { normalizeWallet, store } from "../../../lib/server/store";
 
+// Positions API:
+// - GET returns positions (optionally filtered by market or wallet)
+// - POST submits a new private position (encrypted stake + choice)
 interface CipherPayload {
   c1: number[];
   c2: number[];
@@ -39,6 +42,7 @@ function parseCipher(value: unknown): CipherPayload | undefined {
 
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method === "GET") {
+    // Read-only list of positions. Wallet filter is optional.
     const marketId = parseId(req.query.marketId);
     const wallet = req.query.wallet ? normalizeWallet(req.query.wallet) : undefined;
     const positions = store
@@ -50,6 +54,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   if (req.method === "POST") {
+    // Create a new encrypted position for a market.
     const marketId =
       typeof req.body?.marketId === "number"
         ? req.body.marketId
