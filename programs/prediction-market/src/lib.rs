@@ -4,11 +4,13 @@ use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
 declare_id!("PredMkt1111111111111111111111111111111111111");
 
+// Seeds are short labels used to derive deterministic account addresses (PDAs).
 pub const MARKET_SEED: &[u8] = b"market";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const POSITION_SEED: &[u8] = b"position";
 pub const REGISTRY_SEED: &[u8] = b"registry";
 
+// Minimum stake is expressed in the smallest unit (lamports) for SPL tokens.
 pub const MIN_STAKE: u64 = 1_000_000; 
 pub const REGISTRY_SPACE: usize = 8 + 256;
 pub const MARKET_SPACE: usize = 8 + 1024; // Optimized space
@@ -29,8 +31,11 @@ pub struct ZkStakeProof {
 
 #[account]
 pub struct MarketRegistry {
+    // Protocol owner / admin key.
     pub authority: Pubkey,
+    // Arcium cluster public key (MPC / privacy layer).
     pub arcium_cluster: Pubkey,
+    // Fixed set of oracles that can vote on settlement.
     pub oracle_keys: [Pubkey; 5],
     pub total_markets: u64, // FIXED: Now used to assign IDs
     pub bump: u8,
@@ -38,13 +43,17 @@ pub struct MarketRegistry {
 
 #[account]
 pub struct Market {
+    // Unique ID and creator for the market.
     pub id: u64,
     pub creator: Pubkey,
+    // Human-readable market title and description.
     pub title: [u8; 128],
     pub description: [u8; 512],
+    // UNIX timestamp after which settlement is allowed.
     pub resolution_timestamp: i64,
     pub status: MarketStatus,
     pub outcome: Option<bool>,
+    // Vault that holds pooled funds for this market.
     pub vault: Pubkey,
     pub total_yes_stake: u64, // FIXED: Track pool for fair payouts
     pub total_no_stake: u64,  // FIXED: Track pool for fair payouts
@@ -62,6 +71,7 @@ pub enum MarketStatus {
 
 #[account]
 pub struct Position {
+    // User position in a specific market (one per user/market).
     pub owner: Pubkey,
     pub market: Pubkey,
     pub deposited_stake: u64,
@@ -88,6 +98,7 @@ pub enum PredictionMarketError {
 pub mod prediction_market {
     use super::*;
 
+    // One-time setup: registers the protocol authority and oracle set.
     pub fn initialize(ctx: Context<Initialize>, arcium_cluster: Pubkey, oracles: [Pubkey; 5]) -> Result<()> {
         let registry = &mut ctx.accounts.registry;
         registry.authority = ctx.accounts.authority.key();
@@ -98,6 +109,7 @@ pub mod prediction_market {
         Ok(())
     }
 
+    // Creates a new prediction market and allocates its vault.
     pub fn create_market(ctx: Context<CreateMarket>, title: String, description: String, resolution_timestamp: i64) -> Result<()> {
         let registry = &mut ctx.accounts.registry;
         let market = &mut ctx.accounts.market;
@@ -120,6 +132,8 @@ pub mod prediction_market {
         Ok(())
     }
 
+    // User submits a position. Stake is transferred into the vault.
+    // ZK proof ensures the stake amount is valid without revealing details.
     pub fn submit_position(ctx: Context<SubmitPosition>, _encrypted_stake: Ciphertext, zk_proof: ZkStakeProof, choice: bool) -> Result<()> {
         let market = &mut ctx.accounts.market;
         let clock = Clock::get()?;
@@ -159,6 +173,8 @@ pub mod prediction_market {
         Ok(())
     }
 
+    // Oracles vote to settle the market after resolution time.
+    // Requires a majority of oracle keys (3 out of 5).
     pub fn vote_on_outcome(ctx: Context<SettleMarket>, yes_won: bool) -> Result<()> {
         let registry = &ctx.accounts.registry;
         let market = &mut ctx.accounts.market;
@@ -190,6 +206,7 @@ pub mod prediction_market {
         Ok(())
     }
 
+    // Winning users claim their payout from the vault.
     pub fn claim_winnings(ctx: Context<ClaimWinnings>) -> Result<()> {
         let market = &ctx.accounts.market;
         let position = &mut ctx.accounts.position;
