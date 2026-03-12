@@ -66,7 +66,7 @@ pub struct Market {
     // Human-readable market title and description.
     pub title: [u8; 128],
     pub description: [u8; 512],
-    // UNIX timestamp after which settlement is allowed.
+    // UNIX timestamp when the market closes (event start).
     pub resolution_timestamp: i64,
     pub status: MarketStatus,
     pub outcome: Option<bool>,
@@ -79,6 +79,8 @@ pub struct Market {
     pub yes_votes: u8,
     pub no_votes: u8,
     pub voters: [Pubkey; 5],
+    // 0 = unset, 1 = yes, 2 = no (indexed to voters array).
+    pub vote_records: [u8; 5],
     pub tally_requested_at: i64,
     pub settled_by: Pubkey,
     pub artifacts: SettlementArtifacts,
@@ -121,6 +123,7 @@ pub enum PredictionMarketError {
     #[msg("You did not win this bet")] DidNotWin,
     #[msg("Market already settled")] AlreadySettled,
     #[msg("Event has already occurred")] EventPassed,
+    #[msg("Resolution timestamp must be in the future")] InvalidResolutionTimestamp,
     #[msg("Resolution window not open")] ResolutionWindowNotOpen,
     #[msg("Tally not requested")] TallyNotRequested,
     #[msg("Challenge window has closed")] ChallengeWindowClosed,
@@ -130,6 +133,7 @@ pub enum PredictionMarketError {
     #[msg("Invalid stake amount")] InvalidStakeAmount,
     #[msg("Insufficient staked balance")] InsufficientStakeBalance,
     #[msg("Only authority can perform this action")] UnauthorizedAuthority,
+    #[msg("Arithmetic overflow")] ArithmeticOverflow,
 }
 
 #[program]
@@ -169,6 +173,12 @@ pub mod prediction_market {
     ) -> Result<()> {
         let registry = &mut ctx.accounts.registry;
         let market = &mut ctx.accounts.market;
+        let clock = Clock::get()?;
+
+        require!(
+            resolution_timestamp > clock.unix_timestamp,
+            PredictionMarketError::InvalidResolutionTimestamp
+        );
 
         market.id = registry.total_markets;
         market.creator = ctx.accounts.creator.key();
@@ -183,6 +193,7 @@ pub mod prediction_market {
         market.yes_votes = 0;
         market.no_votes = 0;
         market.voters = [Pubkey::default(); 5];
+        market.vote_records = [0u8; 5];
         market.tally_requested_at = 0;
         market.settled_by = Pubkey::default();
         market.artifacts = SettlementArtifacts::default();
@@ -335,13 +346,21 @@ pub mod prediction_market {
         require!(revealed_choice == market_outcome, PredictionMarketError::DidNotWin);
 
         // Parimutuel payout logic: payout = (user_stake / winning_pool) * total_pool
-        let total_pool = market.total_yes_stake + market.total_no_stake;
-        let winning_pool = if market_outcome { market.total_yes_stake } else { market.total_no_stake };
+        let total_pool = market.total_yes_stake as u128 + market.total_no_stake as u128;
+        let winning_pool = if market_outcome {
+            market.total_yes_stake as u128
+        } else {
+            market.total_no_stake as u128
+        };
         require!(winning_pool > 0, PredictionMarketError::MarketNotSettled);
 
         let payout = (position.deposited_stake as u128)
-            .checked_mul(total_pool as u128).unwrap()
-            .checked_div(winning_pool as u128).unwrap() as u64;
+            .checked_mul(total_pool)
+            .ok_or(PredictionMarketError::ArithmeticOverflow)?
+            .checked_div(winning_pool)
+            .ok_or(PredictionMarketError::ArithmeticOverflow)?;
+        require!(payout <= u64::MAX as u128, PredictionMarketError::ArithmeticOverflow);
+        let payout = payout as u64;
 
         let market_id_bytes = market.id.to_le_bytes();
         let seeds = &[VAULT_SEED, market_id_bytes.as_ref(), &[market.vault_bump]];
@@ -441,7 +460,11 @@ pub mod prediction_market {
         );
         let stake = &mut ctx.accounts.oracle_stake;
         let clamped_bps = slash_bps.min(5_000).max(50) as u64;
-        let slash_amount = stake.amount.saturating_mul(clamped_bps).saturating_div(10_000);
+        let slash_amount = (stake.amount as u128)
+            .saturating_mul(clamped_bps as u128)
+            .saturating_div(10_000u128);
+        require!(slash_amount <= u64::MAX as u128, PredictionMarketError::ArithmeticOverflow);
+        let slash_amount = slash_amount as u64;
         require!(slash_amount > 0, PredictionMarketError::InsufficientStakeBalance);
 
         let stake_seeds = &[ORACLE_STAKE_SEED, stake.oracle.as_ref(), &[stake.bump]];
@@ -474,18 +497,28 @@ pub mod prediction_market {
         let oracle_key = ctx.accounts.authority.key();
         require!(!market.voters.iter().any(|&k| k == oracle_key), PredictionMarketError::AlreadyVoted);
 
-        for voter in market.voters.iter_mut() {
+        let mut inserted = false;
+        for (idx, voter) in market.voters.iter_mut().enumerate() {
             if *voter == Pubkey::default() {
                 *voter = oracle_key;
+                market.vote_records[idx] = if yes_won { 1 } else { 2 };
+                inserted = true;
                 break;
             }
         }
+        require!(inserted, PredictionMarketError::AlreadyVoted);
 
-        if yes_won {
-            market.yes_votes = market.yes_votes.saturating_add(1);
-        } else {
-            market.no_votes = market.no_votes.saturating_add(1);
+        let mut yes_votes = 0u8;
+        let mut no_votes = 0u8;
+        for vote in market.vote_records.iter() {
+            if *vote == 1 {
+                yes_votes = yes_votes.saturating_add(1);
+            } else if *vote == 2 {
+                no_votes = no_votes.saturating_add(1);
+            }
         }
+        market.yes_votes = yes_votes;
+        market.no_votes = no_votes;
 
         if market.yes_votes >= 3 || market.no_votes >= 3 {
             market.status = MarketStatus::SettledPending;
