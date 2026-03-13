@@ -1,6 +1,6 @@
 ﻿import type { NextApiRequest, NextApiResponse } from "next";
 import { serializePosition } from "../../../utils/api";
-import { normalizeWallet, store } from "../../../lib/server/store";
+import { isValidWalletAddress, normalizeWallet, store } from "../../../lib/server/store";
 
 // Positions API:
 // - GET returns positions (optionally filtered by market or wallet)
@@ -50,7 +50,12 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method === "GET") {
     // Read-only list of positions. Wallet filter is optional.
     const marketId = parseId(req.query.marketId);
-    const wallet = req.query.wallet ? normalizeWallet(req.query.wallet) : undefined;
+    const walletRaw = Array.isArray(req.query.wallet) ? req.query.wallet[0] : req.query.wallet;
+    if (walletRaw && !isValidWalletAddress(walletRaw.trim())) {
+      res.status(400).json({ error: "Invalid wallet filter." });
+      return;
+    }
+    const wallet = walletRaw ? normalizeWallet(walletRaw) : undefined;
     const positions = store
       .listPositions({ marketId, wallet })
       .slice(0, 100)
@@ -65,7 +70,8 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       typeof req.body?.marketId === "number"
         ? req.body.marketId
         : Number.parseInt(String(req.body?.marketId), 10);
-    const wallet = normalizeWallet(req.body?.wallet);
+    const walletRaw = typeof req.body?.wallet === "string" ? req.body.wallet.trim() : "";
+    const wallet = normalizeWallet(walletRaw);
     const encryptedStake = parseCipher(req.body?.encryptedStake);
     const encryptedChoice = parseCipher(req.body?.encryptedChoice);
     const commitment = parseCommitment(req.body?.commitment);
@@ -90,6 +96,11 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     }
     if (!version) {
       res.status(400).json({ error: "Unsupported payload version." });
+      return;
+    }
+    // Require a valid wallet to avoid spoofed submissions.
+    if (!walletRaw || !isValidWalletAddress(wallet)) {
+      res.status(401).json({ error: "Valid wallet required to submit positions." });
       return;
     }
 
