@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from "next";
-import { normalizeWallet, store } from "../../../../lib/server/store";
+import { isValidWalletAddress, normalizeWallet, store } from "../../../../lib/server/store";
 import type { EvidenceSourceType } from "../../../../lib/server/services/dispute-engine";
 
 const EVIDENCE_SOURCE_TYPES: EvidenceSourceType[] = [
@@ -69,7 +69,8 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   if (req.method === "POST") {
-    const wallet = normalizeWallet(req.body?.wallet);
+    const walletRaw = typeof req.body?.wallet === "string" ? req.body.wallet.trim() : "";
+    const wallet = normalizeWallet(walletRaw);
     const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
     const evidenceSummary =
       typeof req.body?.evidenceSummary === "string" ? req.body.evidenceSummary.trim() : "";
@@ -86,6 +87,11 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     }
     if (evidenceUri && !/^https?:\/\//i.test(evidenceUri)) {
       res.status(400).json({ error: "Evidence URI must start with http:// or https://." });
+      return;
+    }
+    // Wallet validation prevents anonymous dispute spam.
+    if (!walletRaw || !isValidWalletAddress(wallet)) {
+      res.status(401).json({ error: "Valid wallet required to open disputes." });
       return;
     }
 
