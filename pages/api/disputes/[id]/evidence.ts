@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from "next";
-import { normalizeWallet, store } from "../../../../lib/server/store";
+import { isValidWalletAddress, normalizeWallet, store } from "../../../../lib/server/store";
 import type { EvidenceSourceType } from "../../../../lib/server/services/dispute-engine";
 
 const EVIDENCE_SOURCE_TYPES: EvidenceSourceType[] = [
@@ -30,7 +30,8 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   const disputeId = parseDisputeId(req.query.id);
-  const submittedBy = normalizeWallet(req.body?.wallet);
+  const walletRaw = typeof req.body?.wallet === "string" ? req.body.wallet.trim() : "";
+  const submittedBy = normalizeWallet(walletRaw);
   const summary = typeof req.body?.summary === "string" ? req.body.summary.trim() : "";
   const uri = typeof req.body?.uri === "string" ? req.body.uri.trim() : "";
   const sourceType = parseEvidenceSourceType(req.body?.sourceType);
@@ -47,6 +48,11 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
   if (uri && !/^https?:\/\//i.test(uri)) {
     res.status(400).json({ error: "Evidence URI must start with http:// or https://." });
+    return;
+  }
+  // Require a valid wallet for evidence submissions.
+  if (!walletRaw || !isValidWalletAddress(submittedBy)) {
+    res.status(401).json({ error: "Valid wallet required to submit evidence." });
     return;
   }
 
