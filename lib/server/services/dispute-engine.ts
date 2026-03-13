@@ -8,6 +8,12 @@ const DEFAULT_SLASH_BPS = 500;
 const MIN_SLASH_BPS = 50;
 const MAX_SLASH_BPS = 2_000;
 const MAX_STAKE_AT_RISK_SOL = 1_000_000;
+const MIN_REASON_LENGTH = 12;
+const MAX_REASON_LENGTH = 280;
+const MIN_EVIDENCE_SUMMARY_LENGTH = 8;
+const MAX_EVIDENCE_SUMMARY_LENGTH = 280;
+const MAX_EVIDENCE_URI_LENGTH = 512;
+const MAX_EVIDENCE_ITEMS = 12;
 
 export type DisputeStatus = "Open" | "Resolved" | "Rejected" | "Expired";
 export type DisputeOutcome = "MarketInvalid" | "SettlementUpheld" | "MarketCancelled";
@@ -148,8 +154,10 @@ export class SettlementDisputeEngine {
     );
     const stakeAtRisk = clampNumber(input.settlementStakeAtRiskSol ?? 0, 0, MAX_STAKE_AT_RISK_SOL);
     const reason = input.reason.trim();
-    if (reason.length < 12) {
-      throw new Error("Dispute reason must be at least 12 characters.");
+    if (reason.length < MIN_REASON_LENGTH || reason.length > MAX_REASON_LENGTH) {
+      throw new Error(
+        `Dispute reason must be between ${MIN_REASON_LENGTH} and ${MAX_REASON_LENGTH} characters.`
+      );
     }
 
     const dispute: SettlementDisputeRecord = {
@@ -170,16 +178,26 @@ export class SettlementDisputeEngine {
     };
 
     if (input.evidenceSummary) {
-      const sourceDomain = normalizeSourceDomain(input.evidenceUri, input.evidenceSourceDomain);
+      const summary = input.evidenceSummary.trim();
+      if (
+        summary.length < MIN_EVIDENCE_SUMMARY_LENGTH ||
+        summary.length > MAX_EVIDENCE_SUMMARY_LENGTH
+      ) {
+        throw new Error(
+          `Evidence summary must be between ${MIN_EVIDENCE_SUMMARY_LENGTH} and ${MAX_EVIDENCE_SUMMARY_LENGTH} characters.`
+        );
+      }
+      const normalizedUri = normalizeEvidenceUri(input.evidenceUri);
+      const sourceDomain = normalizeSourceDomain(normalizedUri, input.evidenceSourceDomain);
       dispute.evidence.push({
         id: randomId("ev"),
         submittedBy: input.submittedBy,
-        summary: input.evidenceSummary,
-        uri: input.evidenceUri,
+        summary,
+        uri: normalizedUri,
         sourceType: input.evidenceSourceType ?? "Other",
         sourceDomain,
-        evidenceHash: evidenceHashFor(input.evidenceSummary, input.evidenceUri, now),
-        verificationStatus: deriveVerificationStatus(input.evidenceUri, sourceDomain),
+        evidenceHash: evidenceHashFor(summary, normalizedUri, now),
+        verificationStatus: deriveVerificationStatus(normalizedUri, sourceDomain),
         createdAt: now,
       });
     }
@@ -198,18 +216,31 @@ export class SettlementDisputeEngine {
     if (dispute.status !== "Open") {
       throw new Error("Dispute is no longer open.");
     }
+    if (dispute.evidence.length >= MAX_EVIDENCE_ITEMS) {
+      throw new Error("Evidence limit reached for this dispute.");
+    }
 
     const now = new Date();
-    const sourceDomain = normalizeSourceDomain(input.uri, input.sourceDomain);
+    const summary = input.summary.trim();
+    if (
+      summary.length < MIN_EVIDENCE_SUMMARY_LENGTH ||
+      summary.length > MAX_EVIDENCE_SUMMARY_LENGTH
+    ) {
+      throw new Error(
+        `Evidence summary must be between ${MIN_EVIDENCE_SUMMARY_LENGTH} and ${MAX_EVIDENCE_SUMMARY_LENGTH} characters.`
+      );
+    }
+    const normalizedUri = normalizeEvidenceUri(input.uri);
+    const sourceDomain = normalizeSourceDomain(normalizedUri, input.sourceDomain);
     dispute.evidence.push({
       id: randomId("ev"),
       submittedBy: input.submittedBy,
-      summary: input.summary,
-      uri: input.uri,
+      summary,
+      uri: normalizedUri,
       sourceType: input.sourceType ?? "Other",
       sourceDomain,
-      evidenceHash: evidenceHashFor(input.summary, input.uri, now),
-      verificationStatus: deriveVerificationStatus(input.uri, sourceDomain),
+      evidenceHash: evidenceHashFor(summary, normalizedUri, now),
+      verificationStatus: deriveVerificationStatus(normalizedUri, sourceDomain),
       createdAt: now,
     });
     dispute.updatedAt = now;
@@ -354,6 +385,27 @@ function evidenceHashFor(summary: string, uri: string | undefined, createdAt: Da
     .update("|")
     .update(createdAt.toISOString())
     .digest("hex");
+}
+
+function normalizeEvidenceUri(uri: string | undefined): string | undefined {
+  if (!uri) return undefined;
+  const trimmed = uri.trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length > MAX_EVIDENCE_URI_LENGTH) {
+    throw new Error(`Evidence URI must be ${MAX_EVIDENCE_URI_LENGTH} characters or less.`);
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "https:") {
+      throw new Error("Evidence URI must use https://");
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("Evidence URI must")) {
+      throw error;
+    }
+    throw new Error("Evidence URI must be a valid https:// URL.");
+  }
+  return trimmed;
 }
 
 function normalizeSourceDomain(uri: string | undefined, sourceDomain: string | undefined): string | undefined {
