@@ -674,7 +674,12 @@ export function normalizeWallet(wallet: string | string[] | undefined): string {
   const value = Array.isArray(wallet) ? wallet[0] : wallet;
   if (!value) return DEMO_WALLET;
   const trimmed = value.trim();
-  return WALLET_PATTERN.test(trimmed) ? trimmed : DEMO_WALLET;
+  return isValidWalletAddress(trimmed) ? trimmed : DEMO_WALLET;
+}
+
+// Validates wallet addresses to avoid leaking demo data on malformed input.
+export function isValidWalletAddress(wallet: string): boolean {
+  return WALLET_PATTERN.test(wallet);
 }
 
 function truncateWallet(wallet: string): string {
