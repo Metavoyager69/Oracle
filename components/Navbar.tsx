@@ -1,4 +1,5 @@
 import React from "react";
+import Image from "next/image";
 import Link from "next/link";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
@@ -16,7 +17,7 @@ export default function Navbar() {
     >
       <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-6 py-4">
         <Link href="/" className="flex items-center gap-2 no-underline">
-          <img
+          <Image
             src="/oracle-logo.svg"
             alt="Oracle logo"
             width={28}
