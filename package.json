@@ -12,10 +12,12 @@
     "test:integration": "node --experimental-strip-types --test --test-isolation=none tests/backend/integration/**/*.test.ts",
     "test:adversarial": "node --experimental-strip-types --test --test-isolation=none tests/backend/adversarial/**/*.test.ts",
     "test:matrix": "npm run test:unit && npm run test:integration && npm run test:adversarial",
-    "audit:backend": "npm audit --omit=dev --audit-level=moderate"
+    "audit:backend": "npm audit --omit=dev --audit-level=moderate",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
+    "@linear/sdk": "^77.0.0",
     "@solana/wallet-adapter-base": "^0.9.23",
     "@solana/wallet-adapter-phantom": "^0.9.28",
     "@solana/wallet-adapter-react": "^0.15.35",
@@ -31,10 +33,13 @@
     "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
+    "@playwright/test": "^1.58.2",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "autoprefixer": "^10.0.1",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^15.5.10",
     "postcss": "^8",
     "tailwindcss": "^3.4.1",
     "typescript": "^5"
