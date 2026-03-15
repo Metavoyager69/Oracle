@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { MARKET_CATEGORIES, type MarketCategory, type MarketStatus } from "../../../utils/program";
 import { serializeMarket } from "../../../utils/api";
-import { enforceRateLimit, rateLimitKey, requireJson } from "../../../lib/server/api-guards";
+import { enforceRateLimit, rateLimitKey, requireJson, requireWalletAuth } from "../../../lib/server/api-guards";
 import { isValidWalletAddress, normalizeWallet, store } from "../../../lib/server/store";
 
 const STATUS_SET = new Set<MarketStatus>(["Open", "Resolving", "Settled", "Cancelled", "Invalid"]);
@@ -73,6 +73,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     const creatorWalletRaw =
       typeof req.body?.creatorWallet === "string" ? req.body.creatorWallet.trim() : "";
     const creatorWallet = normalizeWallet(creatorWalletRaw);
+    const auth = typeof req.body?.auth === "object" ? req.body.auth : undefined;
 
     if (!title || title.length > 128) {
       res.status(400).json({ error: "Title is required and must be 128 chars or less." });
@@ -105,6 +106,15 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     // Require a real wallet to prevent demo or malformed input from creating markets.
     if (!creatorWalletRaw || !isValidWalletAddress(creatorWallet)) {
       res.status(401).json({ error: "Valid wallet required to create a market." });
+      return;
+    }
+    if (
+      !requireWalletAuth(req, res, {
+        wallet: creatorWallet,
+        action: "markets:create",
+        auth,
+      })
+    ) {
       return;
     }
 
