@@ -1,0 +1,80 @@
+import type { NextApiRequest, NextApiResponse } from "next";
+
+type RateLimitOptions = {
+  key: string;
+  limit: number;
+  windowMs: number;
+};
+
+type RateLimitState = {
+  count: number;
+  resetAt: number;
+};
+
+const buckets = new Map<string, RateLimitState>();
+const MAX_BUCKETS = 10_000;
+
+export function getClientIp(req: NextApiRequest): string {
+  const headerValue = req.headers["x-forwarded-for"];
+  const forwarded = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+  if (forwarded) {
+    const first = forwarded.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  return req.socket?.remoteAddress ?? "unknown";
+}
+
+export function rateLimitKey(req: NextApiRequest, scope: string): string {
+  return `${scope}:${getClientIp(req)}`;
+}
+
+export function enforceRateLimit(
+  req: NextApiRequest,
+  res: NextApiResponse,
+  options: RateLimitOptions
+): boolean {
+  const now = Date.now();
+  const entry = buckets.get(options.key);
+  if (!entry || entry.resetAt <= now) {
+    buckets.set(options.key, {
+      count: 1,
+      resetAt: now + options.windowMs,
+    });
+  } else {
+    entry.count += 1;
+  }
+
+  const active = buckets.get(options.key);
+  if (!active) return true;
+
+  const remaining = Math.max(0, options.limit - active.count);
+  res.setHeader("X-RateLimit-Limit", options.limit.toString());
+  res.setHeader("X-RateLimit-Remaining", remaining.toString());
+  res.setHeader("X-RateLimit-Reset", Math.ceil(active.resetAt / 1000).toString());
+
+  if (active.count > options.limit) {
+    const retryAfter = Math.max(1, Math.ceil((active.resetAt - now) / 1000));
+    res.setHeader("Retry-After", retryAfter.toString());
+    res.status(429).json({ error: "Rate limit exceeded. Please retry shortly." });
+    return false;
+  }
+
+  if (buckets.size > MAX_BUCKETS) {
+    for (const [key, value] of buckets.entries()) {
+      if (value.resetAt <= now) {
+        buckets.delete(key);
+      }
+    }
+  }
+
+  return true;
+}
+
+export function requireJson(req: NextApiRequest, res: NextApiResponse): boolean {
+  const contentType = req.headers["content-type"] ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    res.status(415).json({ error: "Expected application/json request body." });
+    return false;
+  }
+  return true;
+}
