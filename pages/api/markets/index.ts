@@ -10,7 +10,7 @@ const BODY_LIMIT = "64kb";
 export const config = {
   api: {
     bodyParser: {
-      sizeLimit: BODY_LIMIT,
+      sizeLimit: "64kb",
     },
   },
 };
