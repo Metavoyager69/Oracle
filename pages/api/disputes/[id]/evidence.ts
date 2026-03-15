@@ -1,4 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from "next";
+import { enforceRateLimit, rateLimitKey, requireJson } from "../../../../lib/server/api-guards";
 import { isValidWalletAddress, normalizeWallet, store } from "../../../../lib/server/store";
 import type { EvidenceSourceType } from "../../../../lib/server/services/dispute-engine";
 
@@ -9,6 +10,15 @@ const EVIDENCE_SOURCE_TYPES: EvidenceSourceType[] = [
   "OnChainEvent",
   "Other",
 ];
+const BODY_LIMIT = "64kb";
+
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: BODY_LIMIT,
+    },
+  },
+};
 
 function parseDisputeId(value: string | string[] | undefined): string {
   const raw = Array.isArray(value) ? value[0] : value;
@@ -29,6 +39,17 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     return;
   }
 
+  if (!requireJson(req, res)) return;
+  if (
+    !enforceRateLimit(req, res, {
+      key: rateLimitKey(req, "disputes:evidence"),
+      limit: 20,
+      windowMs: 60 * 60 * 1000,
+    })
+  ) {
+    return;
+  }
+
   const disputeId = parseDisputeId(req.query.id);
   const walletRaw = typeof req.body?.wallet === "string" ? req.body.wallet.trim() : "";
   const submittedBy = normalizeWallet(walletRaw);
@@ -46,8 +67,8 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     res.status(400).json({ error: "Evidence summary must be at least 8 characters." });
     return;
   }
-  if (uri && !/^https?:\/\//i.test(uri)) {
-    res.status(400).json({ error: "Evidence URI must start with http:// or https://." });
+  if (uri && !/^https:\/\//i.test(uri)) {
+    res.status(400).json({ error: "Evidence URI must start with https://." });
     return;
   }
   // Require a valid wallet for evidence submissions.
