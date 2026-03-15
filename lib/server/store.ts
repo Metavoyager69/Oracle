@@ -56,7 +56,7 @@ interface StoredPosition extends DemoPosition {
   encryptedStake?: { c1: number[]; c2: number[] };
   encryptedChoice?: { c1: number[]; c2: number[] };
   txSig?: string;
-  version: number; // Added versioning
+  version: number;
 }
 
 interface TelemetryEvent {
@@ -163,29 +163,14 @@ export interface SubmitPositionInput {
   encryptedChoice?: { c1: number[]; c2: number[] };
 }
 
-// [ARCHITECT UPGRADE] - Graceful Schema Migrations
 function migrateSnapshot(snapshot: any): StoreSnapshot {
   let data = { ...snapshot };
-
-  // v1 -> v2 Migration
   if (data.version === 1) {
     console.log("[oracle-store] Migrating snapshot from v1 to v2...");
-    
-    // Add version field to all markets
-    data.markets = data.markets.map((m: any) => ({
-      ...m,
-      version: 1
-    }));
-
-    // Add version field to all positions
-    data.positions = data.positions.map((p: any) => ({
-      ...p,
-      version: 1
-    }));
-
+    data.markets = (data.markets || []).map((m: any) => ({ ...m, version: 1 }));
+    data.positions = (data.positions || []).map((p: any) => ({ ...p, version: 1 }));
     data.version = 2;
   }
-
   return data as StoreSnapshot;
 }
 
@@ -204,13 +189,11 @@ export class OracleStore {
   constructor() {
     this.persistencePath = resolvePersistencePath();
     const rawSnapshot = this.persistencePath ? loadRawSnapshot(this.persistencePath) : null;
-    
     if (rawSnapshot) {
       const snapshot = migrateSnapshot(rawSnapshot);
       this.applySnapshot(snapshot);
       return;
     }
-
     this.seedDemoData();
   }
 
@@ -227,29 +210,54 @@ export class OracleStore {
       };
     });
     this.nextMarketId = this.markets.reduce((max, market) => Math.max(max, market.id), -1) + 1;
-    this.nextPositionId =
-      this.positions.reduce((max, position) => Math.max(max, position.id), 1000) + 1;
+    this.nextPositionId = this.positions.reduce((max, position) => Math.max(max, position.id), 1000) + 1;
 
     this.seedIndexerAndTelemetry();
     this.persistSnapshot();
+  }
+
+  private seedIndexerAndTelemetry() {
+    for (const market of this.markets) {
+      this.indexer.consumeEvent({
+        marketId: market.id,
+        type: "MARKET_CREATED",
+        actor: "system",
+        details: `Market seeded: ${market.title}`,
+        timestamp: market.timeline[0]?.timestamp ?? new Date(),
+      });
+    }
+    for (const position of this.positions) {
+      const telemetry = deriveTelemetryFromCommitment(position.commitment);
+      this.appendTelemetry({
+        marketId: position.marketId,
+        timestamp: position.submittedAt,
+        yesDelta: telemetry.side === "YES" ? telemetry.volumeSol : 0,
+        noDelta: telemetry.side === "NO" ? telemetry.volumeSol : 0,
+        volumeSol: telemetry.volumeSol,
+        source: position.visibility,
+      });
+    }
+    for (const market of this.markets) {
+      this.rebuildProbabilityHistory(market.id);
+    }
   }
 
   private applySnapshot(snapshot: StoreSnapshot) {
     this.markets = snapshot.markets.map(deserializeMarketSnapshot);
     this.positions = snapshot.positions.map(deserializePositionSnapshot);
     this.probabilityByMarket = new Map(
-      snapshot.probabilityByMarket.map((entry) => [
+      (snapshot.probabilityByMarket || []).map((entry) => [
         entry.marketId,
         entry.points.map(deserializeProbabilityPointSnapshot),
       ])
     );
     this.telemetryByMarket = new Map(
-      snapshot.telemetryByMarket.map((entry) => [
+      (snapshot.telemetryByMarket || []).map((entry) => [
         entry.marketId,
         entry.events.map(deserializeTelemetryEventSnapshot),
       ])
     );
-    this.pendingTelemetry = snapshot.pendingTelemetry.map(deserializePendingTelemetrySnapshot);
+    this.pendingTelemetry = (snapshot.pendingTelemetry || []).map(deserializePendingTelemetrySnapshot);
     this.nextMarketId = snapshot.nextMarketId;
     this.nextPositionId = snapshot.nextPositionId;
     this.disputeEngine.restore(snapshot.disputeEngine);
@@ -262,12 +270,10 @@ export class OracleStore {
       savedAt: new Date().toISOString(),
       markets: this.markets.map(serializeMarketSnapshot),
       positions: this.positions.map(serializePositionSnapshot),
-      probabilityByMarket: Array.from(this.probabilityByMarket.entries()).map(
-        ([marketId, points]) => ({
-          marketId,
-          points: points.map(serializeProbabilityPointSnapshot),
-        })
-      ),
+      probabilityByMarket: Array.from(this.probabilityByMarket.entries()).map(([marketId, points]) => ({
+        marketId,
+        points: points.map(serializeProbabilityPointSnapshot),
+      })),
       telemetryByMarket: Array.from(this.telemetryByMarket.entries()).map(([marketId, events]) => ({
         marketId,
         events: events.map(serializeTelemetryEventSnapshot),
@@ -294,15 +300,12 @@ export class OracleStore {
         if (status && market.status !== status) return false;
         if (category && market.category !== category) return false;
         if (normalizedSearch) {
-          const haystack =
-            `${market.title} ${market.description} ${market.resolutionSource}`.toLowerCase();
+          const haystack = `${market.title} ${market.description} ${market.resolutionSource}`.toLowerCase();
           return haystack.includes(normalizedSearch);
         }
         return true;
       })
-      .sort(
-        (left, right) => left.resolutionTimestamp.getTime() - right.resolutionTimestamp.getTime()
-      )
+      .sort((left, right) => left.resolutionTimestamp.getTime() - right.resolutionTimestamp.getTime())
       .map(cloneMarket);
   }
 
@@ -325,35 +328,15 @@ export class OracleStore {
       totalParticipants: 0,
       rules: input.rules,
       resolutionSource: input.resolutionSource,
-      version: 1, // New markets start at current schema version
+      version: 1,
       timeline: [
-        {
-          id: `m${id}_created`,
-          label: "Market created",
-          note: `Created by ${truncateWallet(input.creatorWallet)}`,
-          timestamp: now,
-          status: "completed",
-        },
-        {
-          id: `m${id}_open`,
-          label: "Positioning window",
-          note: "Encrypted stakes and votes accepted.",
-          timestamp: now,
-          status: "active",
-        },
+        { id: `m${id}_created`, label: "Market created", note: `Created by ${truncateWallet(input.creatorWallet)}`, timestamp: now, status: "completed" },
+        { id: `m${id}_open`, label: "Positioning window", note: "Encrypted positions accepted.", timestamp: now, status: "active" },
       ],
     };
-
     this.markets.unshift(market);
     this.rebuildProbabilityHistory(market.id);
-    this.indexer.consumeEvent({
-      marketId: market.id,
-      type: "MARKET_CREATED",
-      actor: input.creatorWallet,
-      details: `Market created: ${market.title}`,
-      timestamp: now,
-    });
-
+    this.indexer.consumeEvent({ marketId: market.id, type: "MARKET_CREATED", actor: input.creatorWallet, details: `Market created: ${market.title}`, timestamp: now });
     this.persistSnapshot();
     return cloneMarket(market);
   }
@@ -361,13 +344,9 @@ export class OracleStore {
   submitPosition(input: SubmitPositionInput): { position: DemoPosition; txSig: string } {
     const market = this.markets.find((item) => item.id === input.marketId);
     if (!market) throw new Error("Market not found.");
-
-    const normalizedWallet = normalizeWallet(input.wallet);
     const now = new Date();
     const id = this.nextPositionId++;
     const txSig = randomBytes(32).toString("hex");
-    const pendingUntil = new Date(now.getTime() + POSITION_BATCH_DELAY_MS);
-
     const position: StoredPosition = {
       id,
       marketId: market.id,
@@ -376,49 +355,26 @@ export class OracleStore {
       status: "Open",
       visibility: "encrypted",
       submittedAt: now,
-      wallet: normalizedWallet,
+      wallet: normalizeWallet(input.wallet),
       commitment: input.commitment,
       sealedAt: new Date(input.sealedAt),
-      pendingUntil,
       encryptedStake: input.encryptedStake,
       encryptedChoice: input.encryptedChoice,
       txSig,
       version: 1
     };
-
     this.positions.unshift(position);
-    market.totalParticipants = market.totalParticipants + 1;
-    this.indexer.consumeEvent({
-      marketId: market.id,
-      type: "POSITION_COMMITTED",
-      actor: "private-participant",
-      details: "Encrypted position queued.",
-      timestamp: now,
-      signature: txSig,
-    });
-
+    market.totalParticipants += 1;
+    this.indexer.consumeEvent({ marketId: market.id, type: "POSITION_COMMITTED", actor: "private-participant", details: "Encrypted position queued.", timestamp: now, signature: txSig });
     this.persistSnapshot();
-    return {
-      position: clonePosition(position),
-      txSig,
-    };
+    return { position: clonePosition(position), txSig };
   }
 
-  getPortfolio(wallet: string): {
-    positions: DemoPosition[];
-    summary: ReturnType<typeof getPortfolioSummary>;
-  } {
+  getPortfolio(wallet: string): { positions: DemoPosition[]; summary: any } {
     this.flushPendingTelemetry();
     const normalizedWallet = normalizeWallet(wallet);
-    const positions = this.positions
-      .filter((position) => position.wallet === normalizedWallet)
-      .sort((left, right) => right.submittedAt.getTime() - left.submittedAt.getTime())
-      .map(clonePosition);
-
-    return {
-      positions,
-      summary: getPortfolioSummary(positions),
-    };
+    const positions = this.positions.filter((p) => p.wallet === normalizedWallet).sort((a, b) => b.submittedAt.getTime() - a.submittedAt.getTime()).map(clonePosition);
+    return { positions, summary: getPortfolioSummary(positions) };
   }
 
   getMarketProbabilityHistory(marketId: number, limit = 64): ProbabilityHistoryPoint[] {
@@ -442,25 +398,14 @@ export class OracleStore {
     if (this.pendingTelemetry.length === 0) return;
     const ready = this.pendingTelemetry.filter(e => e.releaseAt.getTime() <= reference.getTime());
     this.pendingTelemetry = this.pendingTelemetry.filter(e => e.releaseAt.getTime() > reference.getTime());
-    
     if (ready.length === 0) return;
-
     for (const event of ready) {
       this.appendTelemetry(event);
-      this.indexer.consumeEvent({
-        marketId: event.marketId,
-        type: "POSITION_BATCHED",
-        actor: "private-participant",
-        details: "Encrypted position batched.",
-        timestamp: event.releaseAt,
-      });
+      this.indexer.consumeEvent({ marketId: event.marketId, type: "POSITION_BATCHED", actor: "private-participant", details: "Encrypted position batched.", timestamp: event.releaseAt });
     }
-
-    const touchedMarkets = new Set(ready.map(e => e.marketId));
-    for (const marketId of touchedMarkets) {
+    for (const marketId of new Set(ready.map(e => e.marketId))) {
       this.rebuildProbabilityHistory(marketId);
     }
-
     this.persistSnapshot();
   }
 
@@ -469,44 +414,22 @@ export class OracleStore {
   }
 
   openMarketDispute(input: OpenDisputeInput): SettlementDisputeRecord {
-    const dispute = this.disputeEngine.openDispute({
-      ...input,
-      contestedResolver: "oracle-mpc-relayer",
-      challengeWindowHours: 24,
-      settlementStakeAtRiskSol: 0,
-    });
-    this.indexer.consumeEvent({
-      marketId: input.marketId,
-      type: "DISPUTE_OPENED",
-      actor: "private-participant",
-      details: "Dispute opened.",
-      timestamp: dispute.createdAt,
-    });
+    const dispute = this.disputeEngine.openDispute({ ...input, contestedResolver: "oracle-mpc-relayer", challengeWindowHours: 24, settlementStakeAtRiskSol: 0 });
+    this.indexer.consumeEvent({ marketId: input.marketId, type: "DISPUTE_OPENED", actor: "private-participant", details: "Dispute opened.", timestamp: dispute.createdAt });
     this.persistSnapshot();
     return dispute;
   }
 
   addDisputeEvidence(input: AddEvidenceInput): SettlementDisputeRecord {
     const dispute = this.disputeEngine.addEvidence(input);
-    this.indexer.consumeEvent({
-      marketId: dispute.marketId,
-      type: "DISPUTE_EVIDENCE_ADDED",
-      actor: "private-participant",
-      details: "Evidence submitted.",
-    });
+    this.indexer.consumeEvent({ marketId: dispute.marketId, type: "DISPUTE_EVIDENCE_ADDED", actor: "private-participant", details: "Evidence submitted." });
     this.persistSnapshot();
     return dispute;
   }
 
   resolveDispute(input: ResolveDisputeInput): SettlementDisputeRecord {
     const dispute = this.disputeEngine.resolveDispute(input);
-    this.indexer.consumeEvent({
-      marketId: dispute.marketId,
-      type: "DISPUTE_RESOLVED",
-      actor: "private-resolver",
-      details: "Dispute resolved.",
-      timestamp: dispute.resolution?.resolvedAt,
-    });
+    this.indexer.consumeEvent({ marketId: dispute.marketId, type: "DISPUTE_RESOLVED", actor: "private-resolver", details: "Dispute resolved.", timestamp: dispute.resolution?.resolvedAt });
     this.persistSnapshot();
     return dispute;
   }
@@ -516,16 +439,13 @@ export class OracleStore {
   }
 
   reconcileIndexerState(): IndexerReconcileReport {
-    return this.indexer.reconcileState(
-      this.markets.map((market) => ({ id: market.id, status: market.status })),
-      this.disputeEngine.listDisputes()
-    );
+    return this.indexer.reconcileState(this.markets.map((m) => ({ id: m.id, status: m.status })), this.disputeEngine.listDisputes());
   }
 
   private rebuildProbabilityHistory(marketId: number) {
     const market = this.markets.find((item) => item.id === marketId);
     if (!market) return;
-    this.probabilityByMarket.set(marketId, []); // Simplified for now
+    this.probabilityByMarket.set(marketId, []); 
   }
 }
 
@@ -556,45 +476,19 @@ function saveStoreSnapshot(path: string, snapshot: StoreSnapshot): void {
 }
 
 function serializeMarketSnapshot(market: DemoMarket & { version: number }): SerializedMarket {
-  return {
-    ...market,
-    resolutionTimestamp: market.resolutionTimestamp.toISOString(),
-    version: market.version,
-    timeline: market.timeline.map((step) => ({
-      ...step,
-      timestamp: step.timestamp.toISOString(),
-    })),
-  };
+  return { ...market, resolutionTimestamp: market.resolutionTimestamp.toISOString(), version: market.version, timeline: market.timeline.map((step) => ({ ...step, timestamp: step.timestamp.toISOString() })) };
 }
 
 function deserializeMarketSnapshot(market: SerializedMarket): DemoMarket & { version: number } {
-  return {
-    ...market,
-    resolutionTimestamp: new Date(market.resolutionTimestamp),
-    version: market.version,
-    timeline: market.timeline.map((step) => ({
-      ...step,
-      timestamp: new Date(step.timestamp),
-    })),
-  };
+  return { ...market, resolutionTimestamp: new Date(market.resolutionTimestamp), version: market.version, timeline: market.timeline.map((step) => ({ ...step, timestamp: new Date(step.timestamp) })) };
 }
 
 function serializePositionSnapshot(position: StoredPosition): SerializedPosition {
-  return {
-    ...position,
-    submittedAt: position.submittedAt.toISOString(),
-    sealedAt: position.sealedAt.toISOString(),
-    version: position.version
-  };
+  return { ...position, submittedAt: position.submittedAt.toISOString(), sealedAt: position.sealedAt.toISOString(), version: position.version };
 }
 
 function deserializePositionSnapshot(position: SerializedPosition): StoredPosition {
-  return {
-    ...position,
-    submittedAt: new Date(position.submittedAt),
-    sealedAt: new Date(position.sealedAt),
-    version: position.version
-  };
+  return { ...position, submittedAt: new Date(position.submittedAt), sealedAt: new Date(position.sealedAt), version: position.version };
 }
 
 function deserializeProbabilityPointSnapshot(point: SerializedProbabilityPoint): ProbabilityHistoryPoint {
@@ -621,6 +515,13 @@ function serializePendingTelemetrySnapshot(event: PendingTelemetryEvent): Serial
   return { ...event, timestamp: event.timestamp.toISOString(), releaseAt: event.releaseAt.toISOString() };
 }
 
+export function normalizeWallet(wallet: string | string[] | undefined): string {
+  const value = Array.isArray(wallet) ? wallet[0] : wallet;
+  if (!value) return DEMO_WALLET;
+  const trimmed = value.trim();
+  return WALLET_PATTERN.test(trimmed) ? trimmed : DEMO_WALLET;
+}
+
 function isValidWalletAddress(wallet: string): boolean {
   return WALLET_PATTERN.test(wallet);
 }
@@ -633,12 +534,15 @@ function commitmentForSeed(id: number, marketId: number, timestamp: Date): strin
   return createHash("sha256").update(`${marketId}:${id}:${timestamp.toISOString()}`).digest("hex");
 }
 
+function deriveTelemetryFromCommitment(commitment: string): { side: PositionSide; volumeSol: number; } {
+  const hash = createHash("sha256").update(commitment).digest();
+  const side: PositionSide = hash[0] % 2 === 0 ? "YES" : "NO";
+  const volumeSol = Number((((hash[1] % 9) + 2) / 10).toFixed(2));
+  return { side, volumeSol };
+}
+
 function cloneMarket(market: DemoMarket): DemoMarket {
-  return {
-    ...market,
-    resolutionTimestamp: new Date(market.resolutionTimestamp),
-    timeline: market.timeline.map((step) => ({ ...step, timestamp: new Date(step.timestamp) })),
-  };
+  return { ...market, resolutionTimestamp: new Date(market.resolutionTimestamp), timeline: market.timeline.map((step) => ({ ...step, timestamp: new Date(step.timestamp) })) };
 }
 
 function clonePosition(position: DemoPosition): DemoPosition {
