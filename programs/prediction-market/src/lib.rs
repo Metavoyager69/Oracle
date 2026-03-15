@@ -22,14 +22,13 @@ pub const DEFAULT_CHALLENGE_WINDOW_SECS: i64 = 24 * 60 * 60;
 pub const BOND_VAULT_SEED: &[u8] = b"bond-vault";
 
 // [ARCHITECT UPGRADE] - Escape Hatch Timeout (7 days)
-// If the market is not settled within 7 days of the resolution time, users can refund.
 pub const LIVENESS_TIMEOUT_SECS: i64 = 7 * 24 * 60 * 60;
 
 // [DATABASE WIZARD OPTIMIZATION] - Optimized account spaces to save Rent SOL.
-pub const REGISTRY_SPACE: usize = 8 + 32 + 32 + (32 * 5) + 8 + 8 + 1; // ~257 bytes
-pub const MARKET_SPACE: usize = 8 + 1200; // ~1060 bytes + padding for new challenge fields
-pub const POSITION_SPACE: usize = 8 + 32 + 32 + 64 + 8 + 1 + 1 + 1; // ~212 bytes
-pub const ORACLE_STAKE_SPACE: usize = 8 + 32 + 8 + 8 + 1; // ~57 bytes
+pub const REGISTRY_SPACE: usize = 8 + 32 + 32 + (32 * 5) + 8 + 8 + 1 + 1; // +1 for version
+pub const MARKET_SPACE: usize = 8 + 1200; 
+pub const POSITION_SPACE: usize = 8 + 32 + 32 + 64 + 8 + 1 + 1 + 1 + 1; // +1 for version
+pub const ORACLE_STAKE_SPACE: usize = 8 + 32 + 8 + 8 + 1 + 1; // +1 for version
 
 /// This structure represents an encrypted message.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -52,9 +51,9 @@ pub struct MarketRegistry {
     pub authority: Pubkey,
     pub arcium_cluster: Pubkey,
     pub oracle_keys: [Pubkey; 5],
-    // Minimum stake required for oracle voting eligibility.
     pub required_oracle_stake: u64,
     pub total_markets: u64,
+    pub version: u8, // [ARCHITECT UPGRADE] - Account versioning
     pub bump: u8,
 }
 
@@ -64,13 +63,13 @@ pub struct OracleStake {
     pub oracle: Pubkey,
     pub amount: u64,
     pub locked_votes: u64,
+    pub version: u8, // [ARCHITECT UPGRADE] - Account versioning
     pub bump: u8,
 }
 
 /// A specific Prediction Market.
 #[account]
 pub struct Market {
-    // [DATABASE WIZARD LAYOUT] - Fields ordered by size for alignment.
     pub id: u64,
     pub creator: Pubkey,
     pub vault: Pubkey,
@@ -91,9 +90,9 @@ pub struct Market {
     pub yes_votes: u8,
     pub no_votes: u8,
     pub voters: [Pubkey; 5],
-    // 0 = unset, 1 = yes, 2 = no (indexed to voters array).
     pub vote_records: [u8; 5],
     pub slashing_executed: bool,
+    pub version: u8, // [ARCHITECT UPGRADE] - Account versioning
     pub bump: u8,
     pub vault_bump: u8,
     pub bond_vault_bump: u8,
@@ -121,6 +120,7 @@ pub struct Position {
     pub deposited_stake: u64,
     pub claimed: bool,
     pub choice: bool,
+    pub version: u8, // [ARCHITECT UPGRADE] - Account versioning
     pub bump: u8,
 }
 
@@ -169,6 +169,7 @@ pub mod prediction_market {
         registry.oracle_keys = oracles;
         registry.required_oracle_stake = 0;
         registry.total_markets = 0;
+        registry.version = 1; // Current schema version
         registry.bump = ctx.bumps.registry;
         Ok(())
     }
@@ -192,7 +193,6 @@ pub mod prediction_market {
         let market = &mut ctx.accounts.market;
         let clock = Clock::get()?;
 
-        // Resolution timestamp should be the event start to prevent early reveals.
         require!(resolution_timestamp > clock.unix_timestamp, PredictionMarketError::InvalidResolutionTimestamp);
         
         market.id = registry.total_markets;
@@ -216,6 +216,7 @@ pub mod prediction_market {
         market.voters = [Pubkey::default(); 5];
         market.vote_records = [0u8; 5];
         market.slashing_executed = false;
+        market.version = 1; // Current schema version
         market.bump = ctx.bumps.market;
         market.vault_bump = ctx.bumps.vault;
         market.bond_vault_bump = ctx.bumps.bond_vault;
@@ -229,7 +230,6 @@ pub mod prediction_market {
         let market = &mut ctx.accounts.market;
         let clock = Clock::get()?;
 
-        // [SECURITY AUDITOR FIX] - Strict timing check.
         require!(clock.unix_timestamp < market.resolution_timestamp, PredictionMarketError::EventPassed);
         require!(market.status == MarketStatus::Open, PredictionMarketError::MarketNotOpen);
         require!(zk_proof.amount >= MIN_STAKE, PredictionMarketError::StakeTooLow);
@@ -247,7 +247,6 @@ pub mod prediction_market {
         );
         token::transfer(cpi_ctx, zk_proof.amount)?;
 
-        // Track pool totals for the fair payout math.
         if choice {
             market.total_yes_stake = market.total_yes_stake.checked_add(zk_proof.amount).unwrap();
         } else {
@@ -261,12 +260,11 @@ pub mod prediction_market {
         position.deposited_stake = zk_proof.amount;
         position.choice = choice;
         position.claimed = false;
+        position.version = 1; // Current schema version
         position.bump = ctx.bumps.position;
         Ok(())
     }
 
-    /// [SECURITY AUDITOR FIX] - Unified Multi-Oracle Consensus.
-    /// Oracles must agree on the result AND the total pools to prevent payout fraud.
     pub fn vote_on_outcome(ctx: Context<VoteOnOutcome>, yes_won: bool, reported_yes_total: u64, reported_no_total: u64) -> Result<()> {
         let registry = &ctx.accounts.registry;
         let market = &mut ctx.accounts.market;
@@ -274,11 +272,9 @@ pub mod prediction_market {
         let clock = Clock::get()?;
         let oracle_key = ctx.accounts.oracle.key();
 
-        // 1. Data Integrity Check: Oracle must report the same totals as recorded on-chain.
         require!(reported_yes_total == market.total_yes_stake, PredictionMarketError::InvalidPoolTotals);
         require!(reported_no_total == market.total_no_stake, PredictionMarketError::InvalidPoolTotals);
 
-        // 2. Oracle Validation.
         let is_valid_oracle = registry.oracle_keys.iter().any(|&k| k == oracle_key);
         require!(is_valid_oracle, PredictionMarketError::UnauthorizedOracle);
         require!(stake.oracle == oracle_key, PredictionMarketError::UnauthorizedOracle);
@@ -310,7 +306,6 @@ pub mod prediction_market {
         market.yes_votes = yes_votes;
         market.no_votes = no_votes;
 
-        // 3. Threshold Check.
         if market.yes_votes >= ORACLE_VOTE_THRESHOLD {
             market.outcome = Some(true);
             market.status = MarketStatus::SettledPending;
@@ -328,7 +323,6 @@ pub mod prediction_market {
         Ok(())
     }
 
-    /// Challenges a pending settlement by posting a bond and evidence hash.
     pub fn challenge_settlement(
         ctx: Context<ChallengeSettlement>,
         evidence_hash: [u8; 32],
@@ -361,7 +355,6 @@ pub mod prediction_market {
         Ok(())
     }
 
-    /// Finalizes settlement when the challenge window closes without disputes.
     pub fn finalize_settlement(ctx: Context<FinalizeSettlement>) -> Result<()> {
         let market = &mut ctx.accounts.market;
         let clock = Clock::get()?;
@@ -372,7 +365,6 @@ pub mod prediction_market {
         Ok(())
     }
 
-    /// Resolves a challenged (invalid) market and routes the challenge bond.
     pub fn resolve_dispute(
         ctx: Context<ResolveDispute>,
         resolution: DisputeResolution,
@@ -442,17 +434,14 @@ pub mod prediction_market {
         Ok(())
     }
 
-    /// Oracle deposits collateral to participate in voting.
     pub fn deposit_oracle_stake(ctx: Context<StakeOracle>, amount: u64) -> Result<()> {
         deposit_oracle_stake_impl(&ctx, amount)
     }
 
-    /// Oracle withdraws collateral once no votes remain locked.
     pub fn withdraw_oracle_stake(ctx: Context<UnstakeOracle>, amount: u64) -> Result<()> {
         withdraw_oracle_stake_impl(&ctx, amount)
     }
 
-    /// Slash minority oracle voters after settlement; unlocks vote locks.
     pub fn slash_minority_oracles(ctx: Context<SlashMinorityOracles>, slash_bps: u16) -> Result<()> {
         let market = &mut ctx.accounts.market;
         require!(market.status == MarketStatus::Settled, PredictionMarketError::MarketNotSettled);
@@ -508,7 +497,6 @@ pub mod prediction_market {
         Ok(())
     }
 
-    /// Winners claim prizes.
     pub fn claim_winnings(ctx: Context<ClaimWinnings>) -> Result<()> {
         let market = &ctx.accounts.market;
         let position = &mut ctx.accounts.position;
@@ -519,7 +507,6 @@ pub mod prediction_market {
         let market_outcome = market.outcome.unwrap();
         require!(position.choice == market_outcome, PredictionMarketError::DidNotWin);
 
-        // [SECURITY AUDITOR FIX] - Checked u128 math for fair pool sharing.
         let total_pool = market.total_yes_stake as u128 + market.total_no_stake as u128;
         let winning_pool = if market_outcome {
             market.total_yes_stake as u128
@@ -536,7 +523,6 @@ pub mod prediction_market {
         require!(payout <= u64::MAX as u128, PredictionMarketError::ArithmeticOverflow);
         let payout = payout as u64;
 
-        // [SECURITY AUDITOR FIX] - CEI Pattern: Mark as claimed BEFORE transfer.
         position.claimed = true;
 
         let market_id_bytes = market.id.to_le_bytes();
@@ -557,8 +543,6 @@ pub mod prediction_market {
         Ok(())
     }
 
-    /// [ARCHITECT UPGRADE] - Escape Hatch Refund
-    /// Refunds a position if the market is cancelled, invalid, OR if it has timed out (7 days).
     pub fn refund_position(ctx: Context<RefundPosition>) -> Result<()> {
         let market = &ctx.accounts.market;
         let position = &mut ctx.accounts.position;
@@ -567,7 +551,6 @@ pub mod prediction_market {
         let is_timed_out = clock.unix_timestamp > market.resolution_timestamp.saturating_add(LIVENESS_TIMEOUT_SECS);
         let is_cancelled = market.status == MarketStatus::Cancelled || market.status == MarketStatus::Invalid;
 
-        // Allow refund if explicitly cancelled/invalid OR if it has been stuck for 7 days.
         require!(
             (is_cancelled || is_timed_out) && !market.challenged,
             PredictionMarketError::MarketNotSettled
@@ -767,7 +750,6 @@ pub struct RefundPosition<'info> {
     pub token_program: Program<'info, Token>,
 }
 
-// Finds the mutable OracleStake account for a given oracle key.
 fn find_oracle_stake_account<'info>(
     accounts: &'info [AccountInfo<'info>],
     oracle: Pubkey,
@@ -795,6 +777,7 @@ fn deposit_oracle_stake_impl(ctx: &Context<StakeOracle>, amount: u64) -> Result<
     let stake = &mut ctx.accounts.oracle_stake;
     if stake.amount == 0 {
         stake.oracle = ctx.accounts.oracle.key();
+        stake.version = 1;
         stake.bump = ctx.bumps.oracle_stake;
     }
     require!(stake.oracle == ctx.accounts.oracle.key(), PredictionMarketError::UnauthorizedOracle);
