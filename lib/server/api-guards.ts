@@ -1,4 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
+import { PublicKey } from "@solana/web3.js";
+import nacl from "tweetnacl";
+import { buildWalletAuthMessage, isWalletAuthFresh } from "../../utils/wallet-auth";
 
 type RateLimitOptions = {
   key: string;
@@ -9,6 +12,12 @@ type RateLimitOptions = {
 type RateLimitState = {
   count: number;
   resetAt: number;
+};
+
+type WalletAuthPayload = {
+  message?: string;
+  signature?: string;
+  timestamp?: string;
 };
 
 const buckets = new Map<string, RateLimitState>();
@@ -76,5 +85,59 @@ export function requireJson(req: NextApiRequest, res: NextApiResponse): boolean 
     res.status(415).json({ error: "Expected application/json request body." });
     return false;
   }
+  return true;
+}
+
+function decodeBase64(value: string): Uint8Array | null {
+  try {
+    return new Uint8Array(Buffer.from(value, "base64"));
+  } catch {
+    return null;
+  }
+}
+
+export function requireWalletAuth(
+  req: NextApiRequest,
+  res: NextApiResponse,
+  options: { wallet: string; action: string; auth: WalletAuthPayload | undefined }
+): boolean {
+  const auth = options.auth;
+  if (!auth?.message || !auth?.signature || !auth?.timestamp) {
+    res.status(401).json({ error: "Wallet signature required." });
+    return false;
+  }
+
+  if (!isWalletAuthFresh(auth.timestamp)) {
+    res.status(401).json({ error: "Wallet signature expired. Please retry." });
+    return false;
+  }
+
+  const expectedMessage = buildWalletAuthMessage(options.action, options.wallet, auth.timestamp);
+  if (auth.message !== expectedMessage) {
+    res.status(401).json({ error: "Wallet signature message mismatch." });
+    return false;
+  }
+
+  const signatureBytes = decodeBase64(auth.signature);
+  if (!signatureBytes) {
+    res.status(401).json({ error: "Invalid wallet signature encoding." });
+    return false;
+  }
+
+  let publicKeyBytes: Uint8Array;
+  try {
+    publicKeyBytes = new PublicKey(options.wallet).toBytes();
+  } catch {
+    res.status(401).json({ error: "Invalid wallet address." });
+    return false;
+  }
+
+  const messageBytes = new TextEncoder().encode(auth.message);
+  const isValid = nacl.sign.detached.verify(messageBytes, signatureBytes, publicKeyBytes);
+  if (!isValid) {
+    res.status(401).json({ error: "Wallet signature verification failed." });
+    return false;
+  }
+
   return true;
 }
