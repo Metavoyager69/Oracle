@@ -488,11 +488,27 @@ function deserializeMarketSnapshot(market: SerializedMarket): DemoMarket & { ver
 }
 
 function serializePositionSnapshot(position: StoredPosition): SerializedPosition {
-  return { ...position, submittedAt: position.submittedAt.toISOString(), sealedAt: position.sealedAt.toISOString(), version: position.version };
+  const { submittedAt, sealedAt, settledAt, pendingUntil, ...rest } = position;
+  return {
+    ...rest,
+    submittedAt: submittedAt.toISOString(),
+    sealedAt: sealedAt.toISOString(),
+    settledAt: settledAt ? settledAt.toISOString() : undefined,
+    pendingUntil: pendingUntil ? pendingUntil.toISOString() : undefined,
+    version: position.version,
+  };
 }
 
 function deserializePositionSnapshot(position: SerializedPosition): StoredPosition {
-  return { ...position, submittedAt: new Date(position.submittedAt), sealedAt: new Date(position.sealedAt), version: position.version };
+  const { submittedAt, sealedAt, settledAt, pendingUntil, ...rest } = position;
+  return {
+    ...rest,
+    submittedAt: new Date(submittedAt),
+    sealedAt: new Date(sealedAt),
+    settledAt: settledAt ? new Date(settledAt) : undefined,
+    pendingUntil: pendingUntil ? new Date(pendingUntil) : undefined,
+    version: position.version,
+  };
 }
 
 function deserializeProbabilityPointSnapshot(point: SerializedProbabilityPoint): ProbabilityHistoryPoint {
