@@ -816,7 +816,8 @@ function resolvePersistencePath(): string | undefined {
   const isBuildPhase = process.env.NEXT_PHASE === "phase-production-build";
   const isDevelopment = process.env.NODE_ENV === "development";
   if (isProduction && !isBuildPhase) {
-    throw new Error("ORACLE_STORE_PATH must be set in production.");
+    // Avoid crashing API routes; log once and fall back to in-memory storage.
+    console.warn("[oracle-store] ORACLE_STORE_PATH not set. Using in-memory store.");
   }
   if (isDevelopment) {
     return resolve(DEFAULT_STORE_PATH);
