@@ -20,7 +20,6 @@ export const VAULT_SEED = Buffer.from("vault");
 export const POSITION_SEED = Buffer.from("position");
 export const REGISTRY_SEED = Buffer.from("registry");
 
-// [BIG PICTURE ALIGNMENT] - Matches lib.rs MarketStatus enum
 export type MarketStatus =
   | "Open"
   | "SettledPending"
@@ -40,6 +39,14 @@ export const MARKET_CATEGORIES: MarketCategory[] = [
   "Macro",
   "Tech",
 ];
+
+export const CATEGORY_STYLES: Record<MarketCategory, { bg: string; border: string; text: string }> = {
+  Crypto: { bg: "rgba(52,211,153,0.1)", border: "rgba(52,211,153,0.2)", text: "#34D399" },
+  Football: { bg: "rgba(96,165,250,0.1)", border: "rgba(96,165,250,0.2)", text: "#60A5FA" },
+  Politics: { bg: "rgba(248,113,113,0.1)", border: "rgba(248,113,113,0.2)", text: "#F87171" },
+  Macro: { bg: "rgba(167,139,250,0.1)", border: "rgba(167,139,250,0.2)", text: "#A78BFA" },
+  Tech: { bg: "rgba(250,204,21,0.1)", border: "rgba(250,204,21,0.2)", text: "#FACC15" },
+};
 
 export interface ResolutionTimelineStep {
   id: string;
@@ -72,7 +79,6 @@ export interface DemoMarket {
   resolutionSource: string;
   timeline: ResolutionTimelineStep[];
   settlementArtifacts?: SettlementArtifacts;
-  // [BIG PICTURE ALIGNMENT] - Track Oracle activity
   yesVotes?: number;
   noVotes?: number;
 }
@@ -90,7 +96,6 @@ export interface DemoPosition {
   submittedAt: Date;
   settledAt?: Date;
   payoutSol?: number;
-  // [BIG PICTURE ALIGNMENT] - Required for on-chain claiming
   choice?: boolean;
 }
 
