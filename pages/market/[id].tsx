@@ -1,371 +1,38 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Head from "next/head";
-import Link from "next/link";
+import React, { useState } from "react";
 import { useRouter } from "next/router";
-import { format, formatDistanceToNow } from "date-fns";
+import Head from "next/head";
 import { useWallet } from "@solana/wallet-adapter-react";
 import { WalletMultiButton } from "@solana/wallet-adapter-react-ui";
+import { format } from "date-fns";
 import Navbar from "../../components/Navbar";
+import { DEMO_MARKETS } from "../../utils/program";
 import {
-  CATEGORY_STYLES,
-  DEMO_MARKETS,
-  calculatePositionPnl,
-  type DemoMarket,
-  type DemoPosition,
-} from "../../utils/program";
-import {
-  ARCIUM_DEVNET_CLUSTER,
-  encryptPositionPayload,
+  encryptStake,
+  encryptChoice,
+  commitStake,
   fetchClusterPublicKey,
-  serializeCiphertext,
+  ARCIUM_DEVNET_CLUSTER,
 } from "../../utils/arcium";
-import {
-  deserializeActivityRecord,
-  deserializeMarket,
-  deserializePosition,
-  deserializeProbabilityPoint,
-  deserializeSettlementDispute,
-  type ApiMarket,
-  type ApiMarketActivityRecord,
-  type ApiPosition,
-  type ApiProbabilityHistoryPoint,
-  type ApiSettlementDisputeRecord,
-  type MarketActivityRecord,
-  type ProbabilityHistoryPoint,
-  type SettlementDisputeRecord,
-} from "../../utils/api";
-import { createWalletAuthPayload, ensureWalletUnlocked } from "../../utils/wallet-guard";
 
-// Market detail page: combines trading UI, privacy-safe activity, and dispute actions.
 type StepState = "idle" | "encrypting" | "submitting" | "confirmed" | "error";
-
-function toHex(bytes: Uint8Array): string {
-  return Array.from(bytes)
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-}
-
-function formatSigned(value: number): string {
-  const rounded = Math.abs(value).toFixed(2);
-  return `${value >= 0 ? "+" : "-"}${rounded} SOL`;
-}
-
-function activityLabel(type: string): string {
-  const labels: Record<string, string> = {
-    MARKET_CREATED: "Market created",
-    POSITION_COMMITTED: "Position committed",
-    POSITION_BATCHED: "Position batched",
-    POSITION_SUBMITTED: "Position submitted",
-    DISPUTE_OPENED: "Dispute opened",
-    DISPUTE_EVIDENCE_ADDED: "Evidence added",
-    DISPUTE_RESOLVED: "Dispute resolved",
-    DISPUTE_SLASHED: "Resolver slashed",
-    MARKET_STATUS_CHANGED: "Status changed",
-  };
-  return labels[type] ?? type;
-}
-
-function ProbabilityChart({ points }: { points: ProbabilityHistoryPoint[] }) {
-  if (points.length < 2) {
-    return <p className="font-mono text-xs text-slate-500">Not enough data points yet.</p>;
-  }
-
-  const width = 560;
-  const height = 200;
-  const padding = 16;
-  const xStep = (width - padding * 2) / (points.length - 1);
-
-  const yesPath = points
-    .map((point, index) => {
-      const x = padding + index * xStep;
-      const y = padding + ((100 - point.yesProbability) / 100) * (height - padding * 2);
-      return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
-    })
-    .join(" ");
-
-  const noPath = points
-    .map((point, index) => {
-      const x = padding + index * xStep;
-      const y = padding + ((100 - point.noProbability) / 100) * (height - padding * 2);
-      return `${index === 0 ? "M" : "L"} ${x.toFixed(2)} ${y.toFixed(2)}`;
-    })
-    .join(" ");
-
-  const latest = points[points.length - 1];
-
-  return (
-    <div>
-      <div className="mb-3 flex items-center justify-between">
-        <p className="font-mono text-xs text-emerald-300">YES {latest.yesProbability.toFixed(1)}%</p>
-        <p className="font-mono text-xs text-rose-300">NO {latest.noProbability.toFixed(1)}%</p>
-      </div>
-      <svg
-        viewBox={`0 0 ${width} ${height}`}
-        className="w-full"
-        style={{ maxHeight: "220px", borderRadius: "8px", background: "rgba(255,255,255,0.03)" }}
-      >
-        <path d={yesPath} stroke="#34D399" fill="none" strokeWidth="2.5" />
-        <path d={noPath} stroke="#F87171" fill="none" strokeWidth="2.5" />
-      </svg>
-      <div className="mt-3 flex justify-between font-mono text-xs text-slate-500">
-        <span>{format(points[0].timestamp, "MMM d, HH:mm")}</span>
-        <span>{format(points[points.length - 1].timestamp, "MMM d, HH:mm")}</span>
-      </div>
-    </div>
-  );
-}
 
 export default function MarketPage() {
   const router = useRouter();
-  const wallet = useWallet();
-  const { connected, publicKey } = wallet;
+  const { id } = router.query;
+  const { connected, publicKey } = useWallet();
+
+  const market = DEMO_MARKETS.find((m) => m.id === Number(id));
+
   const [choice, setChoice] = useState<"yes" | "no" | null>(null);
-  const stakeInputRef = useRef<HTMLInputElement | null>(null);
-  const [hasStake, setHasStake] = useState(false);
-  const [maskStake, setMaskStake] = useState(true);
+  const [stakeInput, setStakeInput] = useState("");
   const [step, setStep] = useState<StepState>("idle");
   const [txSig, setTxSig] = useState<string | null>(null);
   const [encryptedPreview, setEncryptedPreview] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [market, setMarket] = useState<DemoMarket | null>(null);
-  const [history, setHistory] = useState<DemoPosition[]>([]);
-  const [probabilityHistory, setProbabilityHistory] = useState<ProbabilityHistoryPoint[]>([]);
-  const [activity, setActivity] = useState<MarketActivityRecord[]>([]);
-  const [disputes, setDisputes] = useState<SettlementDisputeRecord[]>([]);
-  const [disputeReason, setDisputeReason] = useState("");
-  const [evidenceSummary, setEvidenceSummary] = useState("");
-  const [evidenceUri, setEvidenceUri] = useState("");
-  const [evidenceSourceType, setEvidenceSourceType] = useState<
-    "OfficialRecord" | "MarketDataAPI" | "NewsArticle" | "OnChainEvent" | "Other"
-  >("Other");
-  const [disputeError, setDisputeError] = useState<string | null>(null);
-  const [historyScope, setHistoryScope] = useState<"wallet" | "wallet_required">("wallet_required");
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState<string | null>(null);
-
-  const marketId = useMemo(() => {
-    if (typeof router.query.id !== "string") return Number.NaN;
-    return Number.parseInt(router.query.id, 10);
-  }, [router.query.id]);
-
-  const fetchMarketData = useCallback(async () => {
-    if (!router.isReady || Number.isNaN(marketId)) return;
-
-    setLoading(true);
-    setLoadError(null);
-
-    try {
-      const wallet = publicKey?.toBase58();
-      const suffix = wallet ? `?wallet=${encodeURIComponent(wallet)}` : "";
-      const response = await fetch(`/api/markets/${marketId}${suffix}`);
-      const payload = await response.json();
-
-      if (!response.ok) {
-        throw new Error(payload?.error ?? "Could not load market.");
-      }
-
-      const marketItem = payload?.market as ApiMarket;
-      const historyItems = Array.isArray(payload?.history)
-        ? (payload.history as ApiPosition[]).map((item) => deserializePosition(item))
-        : [];
-      const probabilityItems = Array.isArray(payload?.probabilityHistory)
-        ? (payload.probabilityHistory as ApiProbabilityHistoryPoint[]).map((item) =>
-            deserializeProbabilityPoint(item)
-          )
-        : [];
-      const activityItems = Array.isArray(payload?.activity)
-        ? (payload.activity as ApiMarketActivityRecord[]).map((item) =>
-            deserializeActivityRecord(item)
-          )
-        : [];
-      const disputeItems = Array.isArray(payload?.disputes)
-        ? (payload.disputes as ApiSettlementDisputeRecord[]).map((item) =>
-            deserializeSettlementDispute(item)
-          )
-        : [];
-      const fetchedHistoryScope = payload?.historyScope === "wallet" ? "wallet" : "wallet_required";
-
-      setMarket(deserializeMarket(marketItem));
-      setHistory(historyItems);
-      // Server decides whether this user may view history (wallet-scoped only).
-      setHistoryScope(fetchedHistoryScope);
-      setProbabilityHistory(probabilityItems);
-      setActivity(activityItems);
-      setDisputes(disputeItems);
-    } catch (caught) {
-      const fallbackMarket = DEMO_MARKETS.find((item) => item.id === marketId) ?? null;
-      setMarket(fallbackMarket);
-      setHistory([]);
-      setHistoryScope("wallet_required");
-      setProbabilityHistory([]);
-      setActivity([]);
-      setDisputes([]);
-      const message = caught instanceof Error ? caught.message : "Unknown API error.";
-      setLoadError(message);
-    } finally {
-      setLoading(false);
-    }
-  }, [marketId, publicKey, router.isReady]);
-
-  useEffect(() => {
-    fetchMarketData();
-  }, [fetchMarketData]);
-
-  async function handleSubmit() {
-    if (!market || !choice || !connected) return;
-    const stakeRaw = stakeInputRef.current?.value ?? "";
-    const stakeSOL = Number.parseFloat(stakeRaw);
-    if (Number.isNaN(stakeSOL) || stakeSOL <= 0) return;
-
-    setError(null);
-
-    try {
-      if (stakeInputRef.current) stakeInputRef.current.value = "";
-      setHasStake(false);
-      await ensureWalletUnlocked(wallet, "submit an encrypted position");
-      const auth = await createWalletAuthPayload(wallet, "positions:submit");
-      setStep("encrypting");
-
-      const clusterKey = await fetchClusterPublicKey(ARCIUM_DEVNET_CLUSTER);
-      const stakeLamports = BigInt(Math.floor(stakeSOL * 1e9));
-      const sealedPayload = await encryptPositionPayload({
-        amountLamports: stakeLamports,
-        choice: choice === "yes",
-        clusterPublicKey: clusterKey,
-        wallet: publicKey?.toBase58(),
-      });
-      const preview = `commitment:${sealedPayload.commitment.slice(0, 14)}... stake:0x${toHex(
-        sealedPayload.encryptedStake.c1.slice(0, 8)
-      )}...`;
-      setEncryptedPreview(preview);
-
-      setStep("submitting");
-
-      const response = await fetch("/api/positions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          marketId: market.id,
-          wallet: publicKey?.toBase58(),
-          commitment: sealedPayload.commitment,
-          sealedAt: sealedPayload.sealedAt,
-          version: sealedPayload.version,
-          encryptedStake: serializeCiphertext(sealedPayload.encryptedStake),
-          encryptedChoice: serializeCiphertext(sealedPayload.encryptedChoice),
-          auth,
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload?.error ?? "Could not submit encrypted position.");
-      }
-
-      setTxSig(typeof payload?.txSig === "string" ? payload.txSig : null);
-      setStep("confirmed");
-      setChoice(null);
-      await fetchMarketData();
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "Unknown error";
-      setError(message);
-      setStep("error");
-    }
-  }
-
-  function handleStakeInput(event: React.ChangeEvent<HTMLInputElement>) {
-    const value = event.currentTarget.value;
-    const parsed = Number.parseFloat(value);
-    setHasStake(Number.isFinite(parsed) && parsed > 0);
-  }
-
-  async function handleOpenDispute() {
-    if (!market || !connected || !publicKey) return;
-    if (!disputeReason.trim()) return;
-
-    setDisputeError(null);
-
-    try {
-      await ensureWalletUnlocked(wallet, "open a dispute");
-      const auth = await createWalletAuthPayload(wallet, "disputes:open");
-      const sourceDomain = evidenceUri
-        ? (() => {
-            try {
-              return new URL(evidenceUri).hostname;
-            } catch {
-              return undefined;
-            }
-          })()
-        : undefined;
-      const response = await fetch(`/api/markets/${market.id}/disputes`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          wallet: publicKey.toBase58(),
-          reason: disputeReason,
-          evidenceSummary: evidenceSummary,
-          evidenceUri: evidenceUri || undefined,
-          evidenceSourceType,
-          evidenceSourceDomain: sourceDomain,
-          auth,
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload?.error ?? "Could not open dispute.");
-      }
-      setDisputeReason("");
-      setEvidenceSummary("");
-      setEvidenceUri("");
-      setEvidenceSourceType("Other");
-      await fetchMarketData();
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "Unknown dispute error.";
-      setDisputeError(message);
-    }
-  }
-
-  async function handleResolveDispute(disputeId: string, outcome: "MarketInvalid" | "SettlementUpheld") {
-    if (!connected || !publicKey) return;
-    try {
-      await ensureWalletUnlocked(wallet, "resolve a dispute");
-      const auth = await createWalletAuthPayload(wallet, "disputes:resolve");
-      const response = await fetch(`/api/disputes/${disputeId}/resolve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          wallet: publicKey.toBase58(),
-          outcome,
-          invalidReasonCode:
-            outcome === "MarketInvalid" ? "ORACLE_DATA_MISMATCH" : undefined,
-          slashBps: outcome === "MarketInvalid" ? 500 : undefined,
-          resolutionNote:
-            outcome === "MarketInvalid"
-              ? "Invalid criteria confirmed by challenger evidence."
-              : "Settlement evidence is sufficient and upheld.",
-          auth,
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload?.error ?? "Could not resolve dispute.");
-      }
-      await fetchMarketData();
-    } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "Unknown dispute error.";
-      setDisputeError(message);
-    }
-  }
-
-  if (loading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center font-mono text-slate-500">
-        Loading market...
-      </div>
-    );
-  }
 
   if (!market) {
     return (
-      <div className="flex min-h-screen items-center justify-center font-mono text-slate-500">
+      <div className="flex items-center justify-center min-h-screen font-mono text-slate-500">
         Market not found.
       </div>
     );
@@ -373,481 +40,268 @@ export default function MarketPage() {
 
   const isOpen = market.status === "Open";
   const isSettled = market.status === "Settled";
-  const categoryStyle = CATEGORY_STYLES[market.category];
   const total = (market.revealedYesStake ?? 0) + (market.revealedNoStake ?? 0);
   const yesP = total === 0 ? 50 : Math.round(((market.revealedYesStake ?? 0) / total) * 100);
   const noP = 100 - yesP;
 
+  async function handleSubmit() {
+    if (!choice || !stakeInput || !connected) return;
+    const stakeSOL = parseFloat(stakeInput);
+    if (isNaN(stakeSOL) || stakeSOL <= 0) return;
+
+    setStep("encrypting");
+    setError(null);
+
+    try {
+      // 1. Fetch Arcium cluster public key
+      const clusterKey = await fetchClusterPublicKey(ARCIUM_DEVNET_CLUSTER);
+
+      // 2. Encrypt stake amount + choice CLIENT-SIDE
+      const stakeLamports = BigInt(Math.floor(stakeSOL * 1e9));
+      const encStake  = encryptStake(stakeLamports, clusterKey);
+      const encChoice = encryptChoice(choice === "yes", clusterKey);
+
+      // 3. Generate stake commitment — hides amount from on-chain state.
+      //    stakeNonce must be stored securely; it is required at settlement
+      //    so the Arcium relayer can call reveal_position and verify the hash.
+      const { commitment, stakeNonce } = await commitStake(stakeLamports);
+
+      // In production: store stakeNonce in user's wallet adapter or local
+      // encrypted storage so the relayer can retrieve it at settlement.
+      // For demo: log nonce to console (DO NOT do this in production).
+      console.info(
+        "STAKE NONCE (keep secret until settlement):",
+        Buffer.from(stakeNonce).toString("hex")
+      );
+
+      // Preview the ciphertext (first 8 bytes of c1 for UI)
+      const preview = `0x${Buffer.from(encStake.c1).slice(0, 8).toString("hex")}…`;
+      setEncryptedPreview(preview);
+
+      setStep("submitting");
+
+      // 4. In production: build + send Anchor transaction here
+      //    Instruction args: encStake, encChoice, stakeLamports, commitment
+      //    e.g. program.methods.submitPosition(
+      //           serializeCiphertext(encStake),
+      //           serializeCiphertext(encChoice),
+      //           new BN(stakeLamports.toString()),
+      //           Array.from(commitment)
+      //         ).accounts({...}).rpc()
+      await new Promise((r) => setTimeout(r, 1800));
+
+      const fakeSig =
+        Array.from(crypto.getRandomValues(new Uint8Array(32)))
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("")
+          .slice(0, 64);
+
+      setTxSig(fakeSig);
+      setStep("confirmed");
+    } catch (e: any) {
+      setError(e.message ?? "Unknown error");
+      setStep("error");
+    }
+  }
+
   return (
     <>
       <Head>
-        <title>{market.title} | Oracle</title>
+        <title>{market.title} · CipherBet</title>
       </Head>
       <Navbar />
 
-      <main className="pink-grid-bg" style={{ minHeight: "100vh", paddingTop: "72px" }}>
-        <div className="mx-auto grid max-w-6xl gap-6 px-6 py-12 lg:grid-cols-[1.2fr_0.8fr]">
-          <div>
-            <button
-              onClick={() => router.push("/")}
-              className="mb-8 flex items-center gap-2 font-mono text-xs text-slate-500 transition-colors hover:text-white"
-            >
-              {"<"} ALL MARKETS
-            </button>
+      <main style={{ minHeight: "100vh", paddingTop: "72px" }}>
+        <div className="max-w-3xl mx-auto px-6 py-12">
 
-            {loadError ? (
-              <p className="mb-4 font-mono text-xs text-amber-300">
-                Backend unavailable, showing fallback data: {loadError}
-              </p>
-            ) : null}
+          {/* Back */}
+          <button onClick={() => router.push("/")}
+                  className="font-mono text-xs text-slate-500 hover:text-white mb-8 flex items-center gap-2 transition-colors">
+            ← ALL MARKETS
+          </button>
 
-            <div className="card mb-6 p-6">
-              <div className="mb-4 flex items-start justify-between gap-4">
-                <h1 className="flex-1 text-xl font-medium leading-snug text-white">{market.title}</h1>
-                <div className="flex flex-shrink-0 flex-col items-end gap-2">
-                  <div
-                    className="font-mono text-xs"
-                    style={{
-                      background: categoryStyle.bg,
-                      border: `1px solid ${categoryStyle.border}`,
-                      borderRadius: "999px",
-                      color: categoryStyle.text,
-                      padding: "4px 10px",
-                    }}
-                  >
-                    {market.category.toUpperCase()}
-                  </div>
-                  <div className="encrypted-tag">{market.status.toUpperCase()}</div>
-                </div>
-              </div>
-              <p className="mb-4 text-sm leading-relaxed text-slate-400">{market.description}</p>
-              <div className="grid gap-4 sm:grid-cols-2">
-                <div>
-                  <p className="font-mono text-xs text-slate-500">RESOLUTION DATE</p>
-                  <p className="font-mono text-sm text-white">{format(market.resolutionTimestamp, "PPP p")}</p>
-                </div>
-                <div>
-                  <p className="font-mono text-xs text-slate-500">RESOLUTION SOURCE</p>
-                  <p className="font-mono text-sm text-cyan-300">{market.resolutionSource}</p>
-                </div>
+          {/* Market header */}
+          <div className="card p-6 mb-6">
+            <div className="flex items-start justify-between gap-4 mb-4">
+              <h1 className="text-white font-body font-medium text-xl leading-snug flex-1">
+                {market.title}
+              </h1>
+              <div className="encrypted-tag flex-shrink-0">
+                <span className={`w-1.5 h-1.5 rounded-full ${isOpen ? "bg-green-400 animate-pulse" : "bg-cyan-400"}`} />
+                {market.status.toUpperCase()}
               </div>
             </div>
-
-            <div className="card mb-6 p-6">
-              <div className="mb-4 flex items-center justify-between">
-                <h2 className="font-mono text-xs tracking-widest text-violet-300">PRICE / PROBABILITY HISTORY</h2>
-                <p className="font-mono text-xs text-slate-500">
-                  {probabilityHistory.length} point{probabilityHistory.length === 1 ? "" : "s"}
-                </p>
+            <p className="text-slate-400 text-sm leading-relaxed mb-4">{market.description}</p>
+            <div className="flex gap-6 flex-wrap">
+              <div>
+                <p className="font-mono text-xs text-slate-500">RESOLUTION</p>
+                <p className="font-mono text-sm text-white">{format(market.resolutionTimestamp, "PPP")}</p>
               </div>
-              <ProbabilityChart points={probabilityHistory} />
-            </div>
-
-            <div className="card mb-6 p-6">
-              <h2 className="mb-4 font-mono text-xs tracking-widest text-violet-300">MARKET ACTIVITY FEED</h2>
-              <div className="space-y-3">
-                {activity.length === 0 ? (
-                  <p className="font-mono text-xs text-slate-500">No indexed activity yet.</p>
-                ) : (
-                  activity.slice(0, 10).map((event) => (
-                    <div
-                      key={event.id}
-                      className="rounded-lg border border-white/10 bg-white/5 px-3 py-2"
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="font-mono text-xs text-cyan-300">{activityLabel(event.type)}</p>
-                        <p className="font-mono text-xs text-slate-500">
-                          {formatDistanceToNow(event.timestamp, { addSuffix: true })}
-                        </p>
-                      </div>
-                      <p className="mt-1 text-xs text-slate-400">{event.details}</p>
-                      <p className="mt-1 font-mono text-[10px] text-slate-500">slot {event.slot}</p>
-                    </div>
-                  ))
-                )}
+              <div>
+                <p className="font-mono text-xs text-slate-500">PARTICIPANTS</p>
+                <p className="font-mono text-sm text-white">{market.totalParticipants}</p>
               </div>
-            </div>
-
-            <div className="card mb-6 p-6">
-              <h2 className="mb-4 font-mono text-xs tracking-widest text-violet-300">RESOLUTION TIMELINE</h2>
-              <div className="space-y-4">
-                {market.timeline.map((timelineStep) => (
-                  <div key={timelineStep.id} className="flex items-start gap-3">
-                    <span
-                      className="mt-1 inline-block h-2.5 w-2.5 rounded-full"
-                      style={{
-                        background:
-                          timelineStep.status === "completed"
-                            ? "#34D399"
-                            : timelineStep.status === "active"
-                              ? "#C084FC"
-                              : "#64748B",
-                      }}
-                    />
-                    <div className="flex-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="font-mono text-xs tracking-wider text-white">
-                          {timelineStep.label.toUpperCase()}
-                        </p>
-                        <p className="font-mono text-xs text-slate-500">
-                          {format(timelineStep.timestamp, "MMM d, yyyy")}
-                        </p>
-                      </div>
-                      <p className="mt-1 text-sm text-slate-400">{timelineStep.note}</p>
-                    </div>
-                  </div>
-                ))}
+              <div>
+                <p className="font-mono text-xs text-slate-500">PRIVACY</p>
+                <p className="font-mono text-sm" style={{ color: "#22D3EE" }}>ARCIUM MPC</p>
               </div>
-            </div>
-
-            <div className="card mb-6 p-6">
-              <h2 className="mb-4 font-mono text-xs tracking-widest text-violet-300">
-                MPC SETTLEMENT ARTIFACTS
-              </h2>
-              {market.settlementArtifacts ? (
-                <div className="space-y-2 text-xs text-slate-300">
-                  <div className="flex flex-wrap justify-between gap-2">
-                    <span className="font-mono text-slate-500">PROOF URI</span>
-                    <span className="font-mono text-cyan-300">{market.settlementArtifacts.proofUri}</span>
-                  </div>
-                  <div className="flex flex-wrap justify-between gap-2">
-                    <span className="font-mono text-slate-500">PROOF HASH</span>
-                    <span className="font-mono">{market.settlementArtifacts.proofHash.slice(0, 24)}...</span>
-                  </div>
-                  <div className="flex flex-wrap justify-between gap-2">
-                    <span className="font-mono text-slate-500">SETTLEMENT HASH</span>
-                    <span className="font-mono">{market.settlementArtifacts.settlementHash.slice(0, 24)}...</span>
-                  </div>
-                  <div className="flex flex-wrap justify-between gap-2">
-                    <span className="font-mono text-slate-500">PUBLISHED</span>
-                    <span className="font-mono text-slate-400">
-                      {market.settlementArtifacts.publishedAt}
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap justify-between gap-2">
-                    <span className="font-mono text-slate-500">VERIFIED BY</span>
-                    <span className="font-mono text-emerald-300">
-                      {market.settlementArtifacts.verifier}
-                    </span>
-                  </div>
-                </div>
-              ) : (
-                <p className="font-mono text-xs text-slate-500">
-                  Artifacts published once MPC settlement completes.
-                </p>
-              )}
-            </div>
-
-            <div className="card mb-6 p-6">
-              <h2 className="mb-4 font-mono text-xs tracking-widest text-violet-300">CLEAR RULES</h2>
-              <ul className="space-y-2 text-sm text-slate-300">
-                {market.rules.map((rule, index) => (
-                  <li key={`${market.id}-rule-${index}`} className="flex gap-2">
-                    <span className="font-mono text-cyan-300">{index + 1}.</span>
-                    <span>{rule}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-
-            <div className="card p-6">
-              <div className="mb-4 flex items-center justify-between">
-                <h2 className="font-mono text-xs tracking-widest text-violet-300">POSITION HISTORY</h2>
-                <Link href="/portfolio" className="font-mono text-xs text-cyan-400">
-                  VIEW ALL
-                </Link>
-              </div>
-              {!connected || historyScope !== "wallet" ? (
-                <p className="font-mono text-xs text-slate-500">
-                  Connect wallet to view your private position history for this market.
-                </p>
-              ) : history.length === 0 ? (
-                <p className="font-mono text-xs text-slate-500">
-                  No wallet-scoped positions in this market yet.
-                </p>
-              ) : (
-                <div className="space-y-3">
-                  {history.map((position) => {
-                    const isEncrypted = position.visibility === "encrypted";
-                    const pnl = calculatePositionPnl(position);
-                    return (
-                      <div
-                        key={position.id}
-                        className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-white/10 bg-white/5 px-3 py-2"
-                      >
-                        <div className="flex items-center gap-3">
-                          <span
-                            className="font-mono text-xs"
-                            style={{
-                              color: isEncrypted
-                                ? "#94A3B8"
-                                : position.side === "YES"
-                                  ? "#34D399"
-                                  : "#F87171",
-                            }}
-                          >
-                            {isEncrypted ? "ENCRYPTED" : position.side}
-                          </span>
-                          <span className="font-mono text-xs text-slate-300">
-                            {isEncrypted ? "PRIVATE" : `${position.stakeSol?.toFixed(2)} SOL`}
-                          </span>
-                          <span className="font-mono text-xs text-slate-500">
-                            {format(position.submittedAt, "MMM d, yyyy")}
-                          </span>
-                        </div>
-                        <span
-                          className="font-mono text-xs"
-                          style={{ color: isEncrypted ? "#94A3B8" : pnl >= 0 ? "#34D399" : "#F87171" }}
-                        >
-                          {isEncrypted ? "—" : formatSigned(pnl)}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
             </div>
           </div>
 
-          <div>
-            {isSettled ? (
-              <div className="card mb-6 p-6">
-                <p className="mb-3 font-mono text-xs text-slate-500">FINAL RESULT</p>
-                <div className="mb-2 flex justify-between">
-                  <span className="font-mono text-sm text-emerald-400">YES {yesP}%</span>
-                  <span className="font-mono text-sm text-rose-400">NO {noP}%</span>
-                </div>
-                <div className="flex h-3 gap-0.5 overflow-hidden rounded-full">
-                  <div style={{ width: `${yesP}%`, background: "linear-gradient(90deg,#34D399,#059669)" }} />
-                  <div style={{ width: `${noP}%`, background: "linear-gradient(90deg,#F87171,#DC2626)" }} />
-                </div>
+          {/* Odds / Result */}
+          {isSettled ? (
+            <div className="card p-6 mb-6">
+              <p className="font-mono text-xs text-slate-500 mb-3">FINAL RESULT</p>
+              <div className="flex justify-between mb-2">
+                <span className="font-mono text-sm" style={{ color: market.outcome ? "#34D399" : "#64748b" }}>
+                  YES {yesP}% {market.outcome && "← WINNER"}
+                </span>
+                <span className="font-mono text-sm" style={{ color: !market.outcome ? "#F87171" : "#64748b" }}>
+                  {!market.outcome && "WINNER →"} NO {noP}%
+                </span>
               </div>
-            ) : null}
+              <div className="flex h-3 rounded-full overflow-hidden gap-0.5">
+                <div style={{ width: `${yesP}%`, background: "linear-gradient(90deg,#34D399,#059669)" }} />
+                <div style={{ width: `${noP}%`, background: "linear-gradient(90deg,#F87171,#DC2626)" }} />
+              </div>
+              <p className="text-xs text-slate-500 mt-3 font-mono">
+                Stakes decrypted by Arcium MPC at settlement block.
+              </p>
+            </div>
+          ) : (
+            <div className="card p-6 mb-6">
+              <div className="flex items-center gap-3 mb-3">
+                <div className="encrypted-tag">
+                  <svg width="10" height="12" viewBox="0 0 10 12" fill="none">
+                    <rect x="1" y="5" width="8" height="7" rx="1.5" stroke="#22D3EE" strokeWidth="1.2"/>
+                    <path d="M3 5V3.5a2 2 0 014 0V5" stroke="#22D3EE" strokeWidth="1.2" strokeLinecap="round"/>
+                  </svg>
+                  ODDS HIDDEN
+                </div>
+                <p className="text-slate-500 font-mono text-xs">
+                  All stakes are encrypted — real-time odds are unavailable by design to prevent herding.
+                </p>
+              </div>
+              <div className="flex h-2 rounded-full overflow-hidden opacity-20"
+                   style={{ background: "repeating-linear-gradient(90deg, #6B3FA0 0px, #6B3FA0 4px, transparent 4px, transparent 8px)" }} />
+            </div>
+          )}
 
-            <div className="card mb-6 p-6">
-              <h2 className="mb-4 font-mono text-sm tracking-widest text-violet-300">SETTLEMENT DISPUTES</h2>
+          {/* Position form */}
+          {isOpen && (
+            <div className="card p-6">
+              <h2 className="font-mono text-sm tracking-widest mb-5" style={{ color: "#C084FC" }}>
+                SUBMIT ENCRYPTED POSITION
+              </h2>
+
               {!connected ? (
-                <div className="py-6 text-center">
-                  <p className="mb-4 text-sm text-slate-400">
-                    Connect wallet to open disputes and submit evidence.
+                <div className="text-center py-8">
+                  <p className="text-slate-400 font-body text-sm mb-4">
+                    Connect your Solana wallet to submit a private position.
                   </p>
-                  <WalletMultiButton />
+                  <WalletMultiButton style={{
+                    background: "linear-gradient(135deg, #6B3FA0, #9B6FD0)",
+                    borderRadius: "8px",
+                    fontFamily: "'JetBrains Mono', monospace",
+                    fontSize: "12px",
+                  }} />
+                </div>
+              ) : step === "confirmed" ? (
+                <div className="text-center py-8">
+                  <div className="text-5xl mb-4">🔒</div>
+                  <p className="font-mono text-sm mb-2" style={{ color: "#34D399" }}>POSITION ENCRYPTED & SUBMITTED</p>
+                  <p className="text-slate-400 text-xs font-body mb-4">
+                    Your stake and choice are encrypted. Arcium nodes will tally
+                    all positions jointly at resolution — no individual vote is ever
+                    revealed until settlement.
+                  </p>
+                  {txSig && (
+                    <a href={`https://explorer.solana.com/tx/${txSig}?cluster=devnet`}
+                       target="_blank" rel="noreferrer"
+                       className="font-mono text-xs"
+                       style={{ color: "#22D3EE" }}>
+                      View tx: {txSig.slice(0, 16)}…
+                    </a>
+                  )}
                 </div>
               ) : (
                 <>
-                  <textarea
-                    value={disputeReason}
-                    onChange={(event) => setDisputeReason(event.target.value)}
-                    placeholder="Explain why this market should be challenged or invalidated."
-                    rows={3}
-                    className="mb-3 w-full resize-none rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none"
-                  />
-                  <input
-                    value={evidenceSummary}
-                    onChange={(event) => setEvidenceSummary(event.target.value)}
-                    placeholder="Evidence summary (optional)"
-                    className="mb-3 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none"
-                  />
-                  <input
-                    value={evidenceUri}
-                    onChange={(event) => setEvidenceUri(event.target.value)}
-                    placeholder="Evidence URI (https://...)"
-                    className="mb-3 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none"
-                  />
-                  <select
-                    value={evidenceSourceType}
-                    onChange={(event) =>
-                      setEvidenceSourceType(
-                        event.target.value as
-                          | "OfficialRecord"
-                          | "MarketDataAPI"
-                          | "NewsArticle"
-                          | "OnChainEvent"
-                          | "Other"
-                      )
-                    }
-                    className="mb-3 w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white outline-none"
-                  >
-                    <option value="Other">Other evidence source</option>
-                    <option value="OfficialRecord">Official record</option>
-                    <option value="MarketDataAPI">Market data API</option>
-                    <option value="NewsArticle">News article</option>
-                    <option value="OnChainEvent">On-chain event</option>
-                  </select>
-                  {disputeError ? <p className="mb-3 font-mono text-xs text-rose-300">{disputeError}</p> : null}
-                  <button onClick={handleOpenDispute} className="btn-secondary w-full">
-                    OPEN DISPUTE
+                  {/* Choice */}
+                  <div className="mb-5">
+                    <p className="font-mono text-xs text-slate-500 mb-3">YOUR PREDICTION</p>
+                    <div className="flex gap-3">
+                      <button onClick={() => setChoice("yes")}
+                              className="flex-1 py-3 rounded-lg font-mono text-sm tracking-widest transition-all"
+                              style={{
+                                background: choice === "yes" ? "rgba(52,211,153,0.15)" : "transparent",
+                                border: `1px solid ${choice === "yes" ? "rgba(52,211,153,0.5)" : "rgba(255,255,255,0.1)"}`,
+                                color: choice === "yes" ? "#34D399" : "#64748b",
+                              }}>
+                        YES ↑
+                      </button>
+                      <button onClick={() => setChoice("no")}
+                              className="flex-1 py-3 rounded-lg font-mono text-sm tracking-widest transition-all"
+                              style={{
+                                background: choice === "no" ? "rgba(248,113,113,0.15)" : "transparent",
+                                border: `1px solid ${choice === "no" ? "rgba(248,113,113,0.5)" : "rgba(255,255,255,0.1)"}`,
+                                color: choice === "no" ? "#F87171" : "#64748b",
+                              }}>
+                        NO ↓
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Stake amount */}
+                  <div className="mb-5">
+                    <p className="font-mono text-xs text-slate-500 mb-2">STAKE AMOUNT (SOL)</p>
+                    <div className="flex gap-2 items-center"
+                         style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: "8px", padding: "12px 16px" }}>
+                      <input
+                        type="number"
+                        min="0.001"
+                        step="0.01"
+                        placeholder="0.10"
+                        value={stakeInput}
+                        onChange={(e: React.ChangeEvent<HTMLInputElement>) => setStakeInput(e.target.value)}
+                        className="flex-1 bg-transparent font-mono text-white text-sm outline-none"
+                      />
+                      <span className="font-mono text-xs text-slate-500">SOL</span>
+                    </div>
+                  </div>
+
+                  {/* Encryption info */}
+                  <div className="mb-5 p-3 rounded-lg"
+                       style={{ background: "rgba(34,211,238,0.05)", border: "1px solid rgba(34,211,238,0.15)" }}>
+                    <p className="font-mono text-xs text-slate-400 leading-relaxed">
+                      🔐 Your position is encrypted with{" "}
+                      <span style={{ color: "#22D3EE" }}>Arcium ElGamal</span> before submission.
+                      The plaintext never touches the blockchain. Arcium MPC nodes hold key shares
+                      and can only decrypt jointly at settlement.
+                    </p>
+                    {encryptedPreview && step === "submitting" && (
+                      <p className="font-mono text-xs mt-2" style={{ color: "#C084FC" }}>
+                        Ciphertext: {encryptedPreview}
+                      </p>
+                    )}
+                  </div>
+
+                  {error && (
+                    <p className="font-mono text-xs text-red-400 mb-4">{error}</p>
+                  )}
+
+                  <button onClick={handleSubmit}
+                          disabled={!choice || !stakeInput || step === "encrypting" || step === "submitting"}
+                          className="btn-primary w-full"
+                          style={{ opacity: !choice || !stakeInput ? 0.5 : 1 }}>
+                    {step === "encrypting" && "⟳ ENCRYPTING…"}
+                    {step === "submitting" && "⟳ SUBMITTING…"}
+                    {(step === "idle" || step === "error") && "🔒 ENCRYPT & SUBMIT POSITION"}
                   </button>
                 </>
               )}
-
-              <div className="mt-5 space-y-3">
-                {disputes.length === 0 ? (
-                  <p className="font-mono text-xs text-slate-500">No disputes yet.</p>
-                ) : (
-                  disputes.slice(0, 6).map((dispute) => (
-                    <div key={dispute.id} className="rounded-lg border border-white/10 bg-white/5 p-3">
-                      <div className="mb-1 flex items-center justify-between">
-                        <p className="font-mono text-xs text-cyan-300">{dispute.status.toUpperCase()}</p>
-                        <p className="font-mono text-xs text-slate-500">
-                          {formatDistanceToNow(dispute.createdAt, { addSuffix: true })}
-                        </p>
-                      </div>
-                      <p className="text-xs text-slate-300">{dispute.reason}</p>
-                      <p className="mt-1 font-mono text-[10px] text-slate-500">
-                        {dispute.evidence.length} evidence item{dispute.evidence.length === 1 ? "" : "s"}
-                      </p>
-                      <p className="mt-1 font-mono text-[10px] text-slate-500">
-                        Verified{" "}
-                        {dispute.evidence.filter((item) => item.verificationStatus === "Verified").length} /
-                        {dispute.evidence.length}
-                      </p>
-                      {dispute.evidence[0]?.evidenceHash ? (
-                        <p className="mt-1 font-mono text-[10px] text-slate-500">
-                          Evidence hash: {dispute.evidence[0].evidenceHash.slice(0, 14)}...
-                        </p>
-                      ) : null}
-                      {dispute.challengeWindow ? (
-                        <p className="mt-1 font-mono text-[10px] text-slate-500">
-                          Challenge deadline: {format(dispute.challengeWindow.deadlineAt, "MMM d, HH:mm")}
-                        </p>
-                      ) : null}
-                      {dispute.invalidResolution ? (
-                        <p className="mt-1 font-mono text-[10px] text-amber-300">
-                          Invalid path: {dispute.invalidResolution.reasonCode}
-                        </p>
-                      ) : null}
-                      {dispute.slashing ? (
-                        <p className="mt-1 font-mono text-[10px] text-rose-300">
-                          Slashed {dispute.slashing.slashAmountSol.toFixed(4)} SOL ({dispute.slashing.slashBps} bps)
-                        </p>
-                      ) : null}
-                      {connected && dispute.status === "Open" ? (
-                        <div className="mt-2 flex gap-2">
-                          <button
-                            onClick={() => handleResolveDispute(dispute.id, "MarketInvalid")}
-                            className="rounded-md border border-amber-400/40 px-2 py-1 font-mono text-[10px] text-amber-300"
-                          >
-                            MARK INVALID
-                          </button>
-                          <button
-                            onClick={() => handleResolveDispute(dispute.id, "SettlementUpheld")}
-                            className="rounded-md border border-emerald-400/40 px-2 py-1 font-mono text-[10px] text-emerald-300"
-                          >
-                            UPHOLD
-                          </button>
-                        </div>
-                      ) : null}
-                    </div>
-                  ))
-                )}
-              </div>
             </div>
+          )}
 
-            {isOpen ? (
-              <div className="card p-6">
-                <h2 className="mb-5 font-mono text-sm tracking-widest text-violet-300">
-                  SUBMIT ENCRYPTED POSITION
-                </h2>
-
-                {!connected ? (
-                  <div className="py-8 text-center">
-                    <p className="mb-4 text-sm text-slate-400">
-                      Connect your Solana wallet to submit a private position.
-                    </p>
-                    <WalletMultiButton />
-                  </div>
-                ) : step === "confirmed" ? (
-                  <div className="py-8 text-center">
-                    <p className="mb-2 font-mono text-sm text-emerald-400">
-                      POSITION ENCRYPTED AND QUEUED
-                    </p>
-                    {txSig ? (
-                      <a
-                        href={`https://explorer.solana.com/tx/${txSig}?cluster=devnet`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="font-mono text-xs text-cyan-400"
-                      >
-                        View tx: {txSig.slice(0, 16)}...
-                      </a>
-                    ) : null}
-                  </div>
-                ) : (
-                  <>
-                    <div className="confidential-panel mb-5">
-                      <div className="confidential-header">
-                        <span>CONFIDENTIAL MODE</span>
-                        <label className="confidential-toggle">
-                          <input
-                            type="checkbox"
-                            checked={maskStake}
-                            onChange={(event) => setMaskStake(event.target.checked)}
-                          />
-                          Mask stake input
-                        </label>
-                      </div>
-                      <p className="text-xs text-slate-400">
-                        Bets are encrypted locally with a WASM cipher before they touch the network.
-                        No plaintext stake or side is transmitted or stored.
-                      </p>
-                    </div>
-                    <div className="mb-5">
-                      <p className="mb-3 font-mono text-xs text-slate-500">YOUR PREDICTION</p>
-                      <div className="flex gap-3">
-                        <button
-                          onClick={() => setChoice("yes")}
-                          data-side="yes"
-                          data-selected={choice === "yes"}
-                          className="prediction-choice"
-                        >
-                          <span>YES</span>
-                          {choice === "yes" ? <span className="choice-indicator">SELECTED</span> : null}
-                        </button>
-                        <button
-                          onClick={() => setChoice("no")}
-                          data-side="no"
-                          data-selected={choice === "no"}
-                          className="prediction-choice"
-                        >
-                          <span>NO</span>
-                          {choice === "no" ? <span className="choice-indicator">SELECTED</span> : null}
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="mb-5">
-                      <p className="mb-2 font-mono text-xs text-slate-500">STAKE AMOUNT (SOL)</p>
-                      <input
-                        ref={stakeInputRef}
-                        type={maskStake ? "password" : "text"}
-                        inputMode="decimal"
-                        autoComplete="off"
-                        placeholder="0.10"
-                        onChange={handleStakeInput}
-                        className="w-full rounded-lg border border-white/10 bg-white/5 px-4 py-3 font-mono text-sm text-white outline-none"
-                      />
-                    </div>
-
-                    {encryptedPreview ? (
-                      <p className="mb-4 font-mono text-xs text-violet-300">Stealth seal: {encryptedPreview}</p>
-                    ) : null}
-                    {error ? <p className="mb-4 font-mono text-xs text-rose-400">{error}</p> : null}
-
-                    <button
-                      onClick={handleSubmit}
-                      disabled={!choice || !hasStake || step === "encrypting" || step === "submitting"}
-                      className="btn-primary w-full"
-                    >
-                      {step === "encrypting" && "ENCRYPTING..."}
-                      {step === "submitting" && "SUBMITTING..."}
-                      {(step === "idle" || step === "error") && "ENCRYPT AND SUBMIT"}
-                    </button>
-                  </>
-                )}
-              </div>
-            ) : null}
-          </div>
         </div>
       </main>
     </>
