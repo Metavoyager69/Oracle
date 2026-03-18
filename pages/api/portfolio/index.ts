@@ -1,9 +1,10 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { serializePosition } from "../../../utils/api";
 import { normalizeWallet, store } from "../../../lib/server/store";
+import { requireWalletAuth } from "../../../lib/server/api-guards";
 
 // Portfolio API: returns wallet-scoped positions and summary metrics.
-// This endpoint intentionally requires a valid wallet parameter.
+// This endpoint intentionally requires a valid wallet parameter and authentication.
 export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     res.setHeader("Allow", ["GET"]);
@@ -22,6 +23,17 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     res.status(401).json({ error: "Valid wallet required to access portfolio." });
     return;
   }
+
+  // [ISSUE 13 FIX] - Enforce auth on GET portfolio
+  let auth;
+  try {
+    auth = req.query.auth ? JSON.parse(req.query.auth as string) : undefined;
+  } catch {
+    res.status(400).json({ error: "Invalid auth payload in query." });
+    return;
+  }
+
+  if (!requireWalletAuth(req, res, { wallet, action: "portfolio:view", auth })) return;
 
   const portfolio = store.getPortfolio(wallet);
 

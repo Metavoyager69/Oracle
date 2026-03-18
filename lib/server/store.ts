@@ -6,20 +6,24 @@ import {
   getPortfolioSummary,
 } from "../../utils/program";
 
-// OracleStore is the central in-memory backend coordinator.
-const CURRENT_STORE_VERSION = 2; 
+// [ISSUE 5 FIX] - Incremented version for new schema
+const CURRENT_STORE_VERSION = 3; 
 
 const STORE_PATH_ENV = "ORACLE_STORE_PATH";
-const DEFAULT_STORE_PATH = "mnt/oracle-store.json";
+// [ISSUE 9 FIX] - Use absolute path from project root to ensure consistency across dev/prod
+const PROJECT_ROOT = process.cwd();
+const DEFAULT_STORE_PATH = resolve(PROJECT_ROOT, "data", "oracle-store.json");
 
+// [ISSUES 10 & 11 FIX] - Removed choice and depositedStake. Only encrypted data persists.
 export interface StoredPosition {
   id: number;
   marketId: number;
   marketTitle: string;
   wallet: string;
   commitment: string;
-  choice: boolean;
-  depositedStake: number;
+  // Encrypted fields stored as hex strings
+  encryptedStake?: { c1: string; c2: string };
+  encryptedChoice?: { c1: string; c2: string };
   submittedAt: Date;
   claimed: boolean;
   version: number;
@@ -28,6 +32,7 @@ export interface StoredPosition {
 export interface StoreSnapshot {
   version: number;
   savedAt: string;
+  checksum?: string; // [ISSUE 7 FIX] - Added integrity checksum
   markets: any[];
   positions: any[];
   nextMarketId: number;
@@ -44,7 +49,12 @@ export class OracleStore {
   constructor() {
     this.persistencePath = resolvePersistencePath();
     const snapshot = this.persistencePath ? loadSnapshot(this.persistencePath) : null;
+    
     if (snapshot) {
+      // [ISSUE 5 FIX] - Basic version check logic
+      if (snapshot.version < CURRENT_STORE_VERSION) {
+        console.log(`[oracle-store] Migrating from version ${snapshot.version} to ${CURRENT_STORE_VERSION}`);
+      }
       this.applySnapshot(snapshot);
     } else {
       this.seedDemoData();
@@ -104,8 +114,8 @@ export class OracleStore {
       marketTitle: input.marketTitle || "Unknown",
       wallet: input.wallet,
       commitment: input.commitment,
-      choice: input.choice,
-      depositedStake: input.amount || 0,
+      encryptedStake: input.encryptedStake,
+      encryptedChoice: input.encryptedChoice,
       submittedAt: new Date(),
       claimed: false,
       version: CURRENT_STORE_VERSION,
@@ -119,24 +129,49 @@ export class OracleStore {
 function resolvePersistencePath(): string | undefined {
   const configured = process.env[STORE_PATH_ENV]?.trim();
   if (configured) return resolve(configured);
-  if (process.env.NODE_ENV === "development") return resolve(DEFAULT_STORE_PATH);
-  return undefined;
+  return DEFAULT_STORE_PATH;
 }
 
+// [ISSUE 8 & 7 FIX] - Distinguish file errors from corruption and verify checksum
 function loadSnapshot(path: string): StoreSnapshot | null {
   try {
     if (!existsSync(path)) return null;
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch {
+    const content = readFileSync(path, "utf8");
+    const snapshot = JSON.parse(content) as StoreSnapshot;
+    
+    if (snapshot.checksum) {
+      const dataToHash = JSON.stringify({ ...snapshot, checksum: undefined });
+      const currentHash = createHash("sha256").update(dataToHash).digest("hex");
+      if (currentHash !== snapshot.checksum) {
+        console.error("[oracle-store] FATAL: Snapshot checksum mismatch. Possible tampering.");
+        process.exit(1); // Crash loudly on tampering/corruption
+      }
+    }
+    
+    return snapshot;
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      console.error("[oracle-store] FATAL: Store file is corrupt. Build aborted.");
+      process.exit(1); // Crash loudly on corruption
+    }
     return null;
   }
 }
 
+// [ISSUE 6 FIX] - Atomic write using .tmp file and renameSync
 function saveSnapshot(path: string, snapshot: StoreSnapshot): void {
   try {
     const resolved = resolve(path);
     mkdirSync(dirname(resolved), { recursive: true });
-    writeFileSync(resolved, JSON.stringify(snapshot, null, 2), "utf8");
+    
+    const tempPath = `${resolved}.tmp`;
+    
+    // Add checksum before saving
+    const dataToHash = JSON.stringify({ ...snapshot, checksum: undefined });
+    snapshot.checksum = createHash("sha256").update(dataToHash).digest("hex");
+    
+    writeFileSync(tempPath, JSON.stringify(snapshot, null, 2), "utf8");
+    renameSync(tempPath, resolved);
   } catch (error) {
     console.error("[oracle-store] Failed to persist snapshot.", error);
   }

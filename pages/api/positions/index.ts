@@ -38,6 +38,20 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     const marketId = parseId(req.query.marketId);
     const walletRaw = Array.isArray(req.query.wallet) ? req.query.wallet[0] : req.query.wallet;
     const wallet = walletRaw ? normalizeWallet(walletRaw) : undefined;
+    
+    // [ISSUE 12 FIX] - Enforce auth on GET history
+    if (wallet && wallet !== "demo_wallet") {
+      let auth;
+      try {
+        auth = req.query.auth ? JSON.parse(req.query.auth as string) : undefined;
+      } catch {
+        res.status(400).json({ error: "Invalid auth payload in query." });
+        return;
+      }
+      
+      if (!requireWalletAuth(req, res, { wallet, action: "positions:list", auth })) return;
+    }
+
     const positions = store.listPositions({ marketId, wallet }).map(p => serializePosition(p));
     res.status(200).json({ positions });
     return;
@@ -83,5 +97,5 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   res.setHeader("Allow", ["GET", "POST"]);
-  res.status(405).json({ error: `Method ${req.method} Not Allowed` });
+  res.status(405).json({ error: `Method ${req.method ?? "UNKNOWN"} Not Allowed` });
 }
