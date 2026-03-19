@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
-import { serializePosition } from "../../../utils/api";
+import { serializeStoredPosition } from "../../../utils/api";
 import { enforceRateLimit, rateLimitKey, requireJson, requireWalletAuth } from "../../../lib/server/api-guards";
-import { isValidWalletAddress, normalizeWallet, store } from "../../../lib/server/store";
+import { normalizeWallet, store } from "../../../lib/server/store";
 
 export const config = {
   api: {
@@ -38,6 +38,11 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     const marketId = parseId(req.query.marketId);
     const walletRaw = Array.isArray(req.query.wallet) ? req.query.wallet[0] : req.query.wallet;
     const wallet = walletRaw ? normalizeWallet(walletRaw) : undefined;
+
+    if (walletRaw && !wallet) {
+      res.status(400).json({ error: "Invalid wallet filter." });
+      return;
+    }
     
     // [ISSUE 12 FIX] - Enforce auth on GET history
     if (wallet && wallet !== "demo_wallet") {
@@ -52,7 +57,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       if (!requireWalletAuth(req, res, { wallet, action: "positions:list", auth })) return;
     }
 
-    const positions = store.listPositions({ marketId, wallet }).map(p => serializePosition(p));
+    const positions = store.listPositions({ marketId, wallet }).map(p => serializeStoredPosition(p));
     res.status(200).json({ positions });
     return;
   }
@@ -65,11 +70,15 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     const wallet = normalizeWallet(req.body?.wallet);
     const commitment = req.body?.commitment;
     const sealedAt = new Date(req.body?.sealedAt);
-    const choice = typeof req.body?.choice === "boolean" ? req.body.choice : undefined;
     const auth = req.body?.auth;
 
-    if (!Number.isFinite(marketId) || !commitment || choice === undefined || isNaN(sealedAt.getTime())) {
-      res.status(400).json({ error: "Invalid submission payload. Choice, commitment, and valid timestamps are required." });
+    if (!Number.isFinite(marketId) || !commitment || isNaN(sealedAt.getTime())) {
+      res.status(400).json({ error: "Invalid submission payload. Commitment and valid timestamps are required." });
+      return;
+    }
+
+    if (!wallet) {
+      res.status(401).json({ error: "Valid wallet required." });
       return;
     }
 
@@ -80,14 +89,12 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
         marketId,
         wallet,
         commitment,
-        sealedAt,
-        choice,
         encryptedStake: parseCipher(req.body?.encryptedStake),
         encryptedChoice: parseCipher(req.body?.encryptedChoice),
       });
 
       res.status(201).json({
-        position: serializePosition(result.position),
+        position: serializeStoredPosition(result.position),
         txSig: result.txSig,
       });
     } catch (err) {
