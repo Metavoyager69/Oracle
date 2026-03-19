@@ -15,16 +15,22 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   const auditLog = store.getAuditLog(10);
   const reconcile = store.reconcileIndexerState();
   const markets = store.listMarkets();
+  const totalPositions = store.listPositions().length;
+  const disputes = store.listDisputes();
+  const openDisputes = disputes.filter((dispute) => dispute.status === "Open").length;
   
   // Aggregate high-level metrics
   const stats = {
-    totalVolumeSol: markets.reduce((sum, m) => sum + (m.totalParticipants * 0.5), 0), // Estimate for demo
+    totalVolumeSol: 0,
+    totalPositions,
+    volumeVisibility: "encrypted",
     activeMarkets: markets.filter(m => m.status === "Open").length,
     settledMarkets: markets.filter(m => m.status === "Settled").length,
-    disputeCount: reconcile.openDisputes,
+    disputeCount: openDisputes,
     indexerEvents: reconcile.totalEvents,
-    lastEventSlot: auditLog[0]?.slot ?? 0,
-    systemStatus: reconcile.openDisputes > 5 ? "DEGRADED" : "HEALTHY"
+    lastEventSlot: reconcile.lastSlot ?? auditLog[0]?.slot ?? 0,
+    integrityVerified: reconcile.integrityVerified,
+    systemStatus: openDisputes > 5 ? "DEGRADED" : "HEALTHY"
   };
 
   res.status(200).json({
