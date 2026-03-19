@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::hash::hashv;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 
-declare_id!("OracleMkt1111111111111111111111111111111111");
+declare_id!("7krCLEf4n4QnLnaLgJQTkQB7bS72PRxbM2dGZLb3oQto");
 
 pub const MARKET_SEED: &[u8]   = b"market";
 pub const VAULT_SEED: &[u8]    = b"vault";
@@ -67,7 +67,16 @@ pub struct Market {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Default, Copy)]
 pub enum MarketStatus {
-    #[default] Open, SettledPending, Settled, Invalid, Cancelled,
+    #[default] Open, SettledPending, Challenged, Settled, Invalid, Cancelled,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum DisputeResolution {
+    Uphold,
+    OverrideYes,
+    OverrideNo,
+    Cancel,
+    Invalid,
 }
 
 #[account]
@@ -92,6 +101,7 @@ pub enum PredictionMarketError {
     #[msg("Unauthorized")] Unauthorized,
     #[msg("Overflow")] Overflow,
     #[msg("Timeout")] Timeout,
+    #[msg("Invalid market state")] BadState,
 }
 
 #[program]
@@ -124,6 +134,18 @@ pub mod prediction_market {
         market.bump = ctx.bumps.market;
         market.vault_bump = ctx.bumps.vault;
         market.bond_vault_bump = ctx.bumps.bond_vault;
+        market.encrypted_yes_stake = Ciphertext::default();
+        market.encrypted_no_stake = Ciphertext::default();
+        market.revealed_yes_stake = 0;
+        market.revealed_no_stake = 0;
+        market.challenge_deadline = 0;
+        market.challenged = false;
+        market.challenger = Pubkey::default();
+        market.challenge_bond = 0;
+        market.yes_votes = 0;
+        market.no_votes = 0;
+        market.voters = [Pubkey::default(); 5];
+        market.vote_records = [0u8; 5];
         registry.total_markets = registry.total_markets.checked_add(1).ok_or(PredictionMarketError::Overflow)?;
         Ok(())
     }
@@ -169,17 +191,21 @@ pub mod prediction_market {
             market.outcome = Some(y >= ORACLE_VOTE_THRESHOLD);
             market.status = MarketStatus::SettledPending;
             market.challenge_deadline = Clock::get()?.unix_timestamp + CHALLENGE_WINDOW_SECS;
+            market.challenged = false;
+            market.challenger = Pubkey::default();
+            market.challenge_bond = 0;
         }
         Ok(())
     }
 
     pub fn challenge_settlement(ctx: Context<ChallengeSettlement>, bond: u64) -> Result<()> {
         let market = &mut ctx.accounts.market;
+        require!(market.status == MarketStatus::SettledPending, PredictionMarketError::BadState);
         require!(!market.challenged, PredictionMarketError::Unauthorized);
         require!(Clock::get()?.unix_timestamp < market.challenge_deadline, PredictionMarketError::Timeout);
         require!(bond >= MIN_CHALLENGE_BOND, PredictionMarketError::StakeLow);
         token::transfer(CpiContext::new(ctx.accounts.token_program.to_account_info(), Transfer { from: ctx.accounts.challenger_token_account.to_account_info(), to: ctx.accounts.bond_vault.to_account_info(), authority: ctx.accounts.challenger.to_account_info() }), bond)?;
-        market.status = MarketStatus::Invalid;
+        market.status = MarketStatus::Challenged;
         market.challenged = true;
         market.challenger = ctx.accounts.challenger.key();
         market.challenge_bond = bond;
@@ -188,17 +214,69 @@ pub mod prediction_market {
 
     pub fn finalize_settlement(ctx: Context<FinalizeSettlement>) -> Result<()> {
         let market = &mut ctx.accounts.market;
+        require!(market.status == MarketStatus::SettledPending, PredictionMarketError::BadState);
         require!(Clock::get()?.unix_timestamp > market.challenge_deadline, PredictionMarketError::Timeout);
         require!(!market.challenged, PredictionMarketError::Unauthorized);
         market.status = MarketStatus::Settled;
         Ok(())
     }
 
-    pub fn resolve_dispute(ctx: Context<ResolveDispute>, outcome: bool) -> Result<()> {
+    pub fn resolve_dispute(ctx: Context<ResolveDispute>, resolution: DisputeResolution) -> Result<()> {
         let market = &mut ctx.accounts.market;
         require!(ctx.accounts.authority.key() == ctx.accounts.registry.authority, PredictionMarketError::Unauthorized);
-        market.outcome = Some(outcome);
-        market.status = MarketStatus::Settled;
+        require!(market.status == MarketStatus::Challenged, PredictionMarketError::BadState);
+
+        let bond_amount = market.challenge_bond;
+        if bond_amount > 0 {
+            let market_id_bytes = market.id.to_le_bytes();
+            let seeds = &[BOND_VAULT_SEED, market_id_bytes.as_ref(), &[market.bond_vault_bump]];
+            let destination = match resolution {
+                DisputeResolution::Uphold => &ctx.accounts.authority_token_account,
+                DisputeResolution::OverrideYes => &ctx.accounts.challenger_token_account,
+                DisputeResolution::OverrideNo => &ctx.accounts.challenger_token_account,
+                DisputeResolution::Cancel => &ctx.accounts.challenger_token_account,
+                DisputeResolution::Invalid => &ctx.accounts.challenger_token_account,
+            };
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    Transfer {
+                        from: ctx.accounts.bond_vault.to_account_info(),
+                        to: destination.to_account_info(),
+                        authority: ctx.accounts.bond_vault.to_account_info(),
+                    },
+                    &[&seeds[..]],
+                ),
+                bond_amount,
+            )?;
+        }
+
+        match resolution {
+            DisputeResolution::Uphold => {
+                require!(market.outcome.is_some(), PredictionMarketError::MpcPending);
+                market.status = MarketStatus::Settled;
+            }
+            DisputeResolution::OverrideYes => {
+                market.outcome = Some(true);
+                market.status = MarketStatus::Settled;
+            }
+            DisputeResolution::OverrideNo => {
+                market.outcome = Some(false);
+                market.status = MarketStatus::Settled;
+            }
+            DisputeResolution::Cancel => {
+                market.outcome = None;
+                market.status = MarketStatus::Cancelled;
+            }
+            DisputeResolution::Invalid => {
+                market.outcome = None;
+                market.status = MarketStatus::Invalid;
+            }
+        }
+
+        market.challenged = false;
+        market.challenge_bond = 0;
+        market.challenger = Pubkey::default();
         Ok(())
     }
 
@@ -319,8 +397,15 @@ pub struct ResolveDispute<'info> {
     pub registry: Account<'info, MarketRegistry>,
     #[account(mut, seeds = [MARKET_SEED, market.id.to_le_bytes().as_ref()], bump = market.bump)]
     pub market: Account<'info, Market>,
+    #[account(mut, seeds = [BOND_VAULT_SEED, market.id.to_le_bytes().as_ref()], bump = market.bond_vault_bump)]
+    pub bond_vault: Account<'info, TokenAccount>,
+    #[account(mut, constraint = challenger_token_account.owner == market.challenger)]
+    pub challenger_token_account: Account<'info, TokenAccount>,
+    #[account(mut, constraint = authority_token_account.owner == authority.key())]
+    pub authority_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
     pub authority: Signer<'info>,
+    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
