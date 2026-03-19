@@ -24,6 +24,10 @@ export default function AuditPage() {
   }, []);
 
   if (loading) return <div className="p-10 text-white font-mono">LOADING SYSTEM METRICS...</div>;
+  const volumeValue =
+    data?.stats?.volumeVisibility === "encrypted"
+      ? "ENCRYPTED"
+      : `${data?.stats?.totalVolumeSol} SOL`;
 
   return (
     <>
@@ -38,7 +42,7 @@ export default function AuditPage() {
               { label: "STATUS", value: data?.stats?.systemStatus, color: "text-emerald-400" },
               { label: "ACTIVE MARKETS", value: data?.stats?.activeMarkets, color: "text-white" },
               { label: "DISPUTES", value: data?.stats?.disputeCount, color: "text-amber-400" },
-              { label: "TOTAL VOLUME", value: `${data?.stats?.totalVolumeSol} SOL`, color: "text-cyan-400" },
+              { label: "TOTAL VOLUME", value: volumeValue, color: "text-cyan-400" },
             ].map(stat => (
               <div key={stat.label} className="card p-6 border-white/10 bg-white/5">
                 <p className="text-[10px] font-mono text-slate-500 tracking-[0.2em] mb-2">{stat.label}</p>
