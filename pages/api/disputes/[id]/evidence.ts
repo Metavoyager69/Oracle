@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { enforceRateLimit, rateLimitKey, requireJson, requireWalletAuth } from "../../../../lib/server/api-guards";
-import { isValidWalletAddress, normalizeWallet, store } from "../../../../lib/server/store";
+import { normalizeWallet, store } from "../../../../lib/server/store";
 import type { EvidenceSourceType } from "../../../../lib/server/services/dispute-engine";
 
 const ALLOWED_EVIDENCE_DOMAINS = ["apnews.com", "reuters.com", "bloomberg.com", "bbc.co.uk", "wsj.com", "nytimes.com", "solscan.io", "explorer.solana.com"];
@@ -75,7 +75,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     return;
   }
   // Require a valid wallet for evidence submissions.
-  if (!walletRaw || !isValidWalletAddress(submittedBy)) {
+  if (!walletRaw || !submittedBy) {
     res.status(401).json({ error: "Valid wallet required to submit evidence." });
     return;
   }
