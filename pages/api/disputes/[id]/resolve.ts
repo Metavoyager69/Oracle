@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { enforceRateLimit, rateLimitKey, requireJson, requireWalletAuth } from "../../../../lib/server/api-guards";
-import { isValidWalletAddress, normalizeWallet, store } from "../../../../lib/server/store";
+import { normalizeWallet, store } from "../../../../lib/server/store";
 import type {
   DisputeOutcome,
   InvalidMarketReasonCode,
@@ -88,7 +88,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     return;
   }
   // Require a valid wallet to resolve disputes.
-  if (!walletRaw || !isValidWalletAddress(resolvedBy)) {
+  if (!walletRaw || !resolvedBy) {
     res.status(401).json({ error: "Valid wallet required to resolve disputes." });
     return;
   }
