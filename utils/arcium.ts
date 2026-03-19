@@ -42,7 +42,7 @@ export interface MarketState {
   title:               string;
   description:         string;
   resolutionTimestamp: Date;
-  status:              "Open" | "Resolving" | "Settled" | "Cancelled";
+  status:              "Open" | "SettledPending" | "Challenged" | "Settled" | "Invalid" | "Cancelled";
   totalParticipants:   number;
   outcome?:            boolean;
   // Only populated after Arcium MPC settlement:
@@ -167,9 +167,11 @@ export function decodeMarketTitle(bytes: number[]): string {
 /** Human-readable status badge label. */
 export function marketStatusLabel(status: MarketState["status"]): string {
   const labels: Record<MarketState["status"], string> = {
-    Open:      "LIVE",
-    Resolving: "RESOLVING",
-    Settled:   "SETTLED",
+    Open: "LIVE",
+    SettledPending: "SETTLEMENT WINDOW",
+    Challenged: "CHALLENGED",
+    Settled: "SETTLED",
+    Invalid: "INVALID",
     Cancelled: "CANCELLED",
   };
   return labels[status];
