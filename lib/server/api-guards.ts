@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { PublicKey } from "@solana/web3.js";
 import nacl from "tweetnacl";
 import { buildWalletAuthMessage, isWalletAuthFresh } from "../../utils/wallet-auth";
+import { store } from "./store";
 
 // [OBSERVABILITY UPGRADE] - Structured Logging helper
 function log(level: string, message: string, data: any = {}) {
@@ -33,14 +34,16 @@ type WalletAuthPayload = {
 const buckets = new Map<string, RateLimitState>();
 const MAX_BUCKETS = 10_000;
 
+// [ISSUE 18 FIX] - Hardened IP detection. Only trust X-Forwarded-For in production (Vercel).
 export function getClientIp(req: NextApiRequest): string {
-  const headerValue = req.headers["x-forwarded-for"];
-  const forwarded = Array.isArray(headerValue) ? headerValue[0] : headerValue;
-  if (forwarded) {
-    const first = forwarded.split(",")[0]?.trim();
-    if (first) return first;
+  if (process.env.NODE_ENV === "production") {
+    const headerValue = req.headers["x-forwarded-for"];
+    const forwarded = Array.isArray(headerValue) ? headerValue[0] : headerValue;
+    if (forwarded) {
+      return forwarded.split(",")[0]?.trim() || "unknown";
+    }
   }
-  return req.socket?.remoteAddress ?? "unknown";
+  return req.socket?.remoteAddress ?? "127.0.0.1";
 }
 
 export function rateLimitKey(req: NextApiRequest, scope: string): string {
@@ -88,6 +91,30 @@ export function enforceRateLimit(
   }
 
   return true;
+}
+
+// [ISSUES 21 & 22 FIX] - Protect internal API endpoints
+export function requireAdminAuth(req: NextApiRequest, res: NextApiResponse): boolean {
+  const adminWallet = store.getRegistryAuthority();
+  const walletInput = req.headers["x-admin-wallet"] as string;
+  const authHeader = req.headers["x-admin-auth"] as string;
+
+  if (!walletInput || !authHeader || walletInput !== adminWallet) {
+    res.status(403).json({ error: "Admin access required." });
+    return false;
+  }
+
+  try {
+    const auth = JSON.parse(authHeader);
+    return requireWalletAuth(req, res, { 
+      wallet: walletInput, 
+      action: "admin:access", 
+      auth 
+    });
+  } catch {
+    res.status(400).json({ error: "Invalid admin auth header." });
+    return false;
+  }
 }
 
 export function requireJson(req: NextApiRequest, res: NextApiResponse): boolean {
