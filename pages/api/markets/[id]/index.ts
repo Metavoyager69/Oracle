@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
-import { serializeMarket, serializePosition } from "../../../../utils/api";
-import { isValidWalletAddress, normalizeWallet, store } from "../../../../lib/server/store";
+import { serializeStoredMarket, serializeStoredPosition } from "../../../../utils/api";
+import { normalizeWallet, store } from "../../../../lib/server/store";
 
 // API endpoint: returns one market plus related chart/activity/dispute data.
 // Important privacy rule: position history is wallet-scoped only.
@@ -30,19 +30,19 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   const walletRaw = Array.isArray(req.query.wallet) ? req.query.wallet[0] : req.query.wallet;
+  const walletScope = walletRaw ? normalizeWallet(walletRaw) : undefined;
   // Reject malformed wallet scopes to prevent accidental data leaks.
-  if (walletRaw && !isValidWalletAddress(walletRaw.trim())) {
+  if (walletRaw && !walletScope) {
     res.status(400).json({ error: "Invalid wallet filter." });
     return;
   }
-  const walletScope = walletRaw ? normalizeWallet(walletRaw) : undefined;
-  const hasWalletScope = Boolean(walletScope && walletScope !== "demo_wallet");
+  const hasWalletScope = Boolean(walletScope);
   // Without a valid wallet, history is intentionally hidden.
   const history = hasWalletScope
     ? store
         .listPositions({ marketId: id, wallet: walletScope })
         .slice(0, 50)
-        .map((position) => serializePosition(position))
+        .map((position) => serializeStoredPosition(position))
     : [];
 
   const probabilityHistory = store.getMarketProbabilityHistory(id, 96).map((point) => ({
@@ -87,7 +87,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }));
 
   res.status(200).json({
-    market: serializeMarket(market),
+    market: serializeStoredMarket(market),
     history,
     historyScope: hasWalletScope ? "wallet" : "wallet_required",
     probabilityHistory,
