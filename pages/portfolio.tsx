@@ -11,6 +11,7 @@ import {
   type DemoPosition,
 } from "../utils/program";
 import { deserializePosition, type ApiPosition } from "../utils/api";
+import { createWalletAuthPayload } from "../utils/wallet-guard";
 
 function formatSigned(value: number): string {
   const rounded = Math.abs(value).toFixed(2);
@@ -18,15 +19,15 @@ function formatSigned(value: number): string {
 }
 
 export default function PortfolioPage() {
-  const { connected, publicKey } = useWallet();
-  const wallet = publicKey?.toBase58();
+  const { connected, publicKey, signMessage } = useWallet();
+  const walletAddress = publicKey?.toBase58();
 
   const [positions, setPositions] = useState<DemoPosition[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!connected || !wallet) {
+    if (!connected || !walletAddress) {
       setPositions([]);
       setLoading(false);
       setLoadError(null);
@@ -40,7 +41,11 @@ export default function PortfolioPage() {
       setLoadError(null);
 
       try {
-        const response = await fetch(`/api/portfolio?wallet=${encodeURIComponent(wallet)}`);
+        const auth = await createWalletAuthPayload({ connected, publicKey, signMessage }, "portfolio:view");
+        const authParam = encodeURIComponent(JSON.stringify(auth));
+        const response = await fetch(
+          `/api/portfolio?wallet=${encodeURIComponent(walletAddress)}&auth=${authParam}`
+        );
         const payload = await response.json();
         if (!response.ok) {
           throw new Error(payload?.error ?? "Could not load portfolio.");
@@ -70,7 +75,7 @@ export default function PortfolioPage() {
     return () => {
       cancelled = true;
     };
-  }, [connected, wallet]);
+  }, [connected, publicKey, signMessage, walletAddress]);
 
   const summary = useMemo(() => getPortfolioSummary(positions), [positions]);
   const hasEncrypted = useMemo(
