@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { promises as fs } from "fs";
 import { dirname, resolve } from "path";
+import Database from "better-sqlite3";
 import { Keypair } from "@solana/web3.js";
 import {
   DEMO_MARKETS,
@@ -29,17 +30,25 @@ import {
 const CURRENT_STORE_VERSION = 3; 
 
 const STORE_PATH_ENV = "ORACLE_STORE_PATH";
+const STORE_BACKEND_ENV = "ORACLE_STORE_BACKEND";
+const DB_PATH_ENV = "ORACLE_DB_PATH";
 // [ISSUE 9 FIX] - Use absolute path from project root to ensure consistency across dev/prod
 const PROJECT_ROOT = process.cwd();
 const DEFAULT_STORE_PATH = resolve(PROJECT_ROOT, "data", "oracle-store.json");
+const DEFAULT_DB_PATH = resolve(PROJECT_ROOT, "data", "oracle-store.db");
 const SNAPSHOT_DEBOUNCE_MS = 750;
 const WALLET_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const ADMIN_WALLET_ENV = "ORACLE_ADMIN_WALLET";
 const ADMIN_KEYPAIR_PATH_ENV = "ORACLE_ADMIN_KEYPAIR_PATH";
 const DEFAULT_ADMIN_KEYPAIR_PATH = resolve(PROJECT_ROOT, "data", "oracle-admin-keypair.json");
+type StoreBackend = "sqlite" | "file";
+
 let pendingSnapshot: StoreSnapshot | null = null;
+let pendingBackend: StoreBackend | null = null;
+let pendingPath: string | undefined;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let missingPersistenceWarned = false;
+let database: Database | null = null;
 
 // [ISSUES 1, 2, 3, 4 FIX] - Strict typing for all data structures
 export interface StoredMarket {
@@ -100,11 +109,21 @@ export interface SubmitPositionInput {
 }
 
 function resolveAdminAuthority(): string {
+  const inProd = process.env.NODE_ENV === "production";
   const explicit = process.env[ADMIN_WALLET_ENV]?.trim();
-  if (explicit && WALLET_PATTERN.test(explicit)) return explicit;
+  if (explicit) {
+    if (!WALLET_PATTERN.test(explicit)) {
+      throw new Error("[oracle-store] ORACLE_ADMIN_WALLET is invalid.");
+    }
+    return explicit;
+  }
 
   const configuredPath = process.env[ADMIN_KEYPAIR_PATH_ENV]?.trim();
   const keypairPath = resolve(configuredPath || DEFAULT_ADMIN_KEYPAIR_PATH);
+
+  if (inProd && !configuredPath) {
+    throw new Error("[oracle-store] Set ORACLE_ADMIN_WALLET or ORACLE_ADMIN_KEYPAIR_PATH in production.");
+  }
 
   try {
     if (existsSync(keypairPath)) {
@@ -112,7 +131,13 @@ function resolveAdminAuthority(): string {
       const keypair = Keypair.fromSecretKey(Uint8Array.from(secret));
       return keypair.publicKey.toBase58();
     }
+    if (inProd) {
+      throw new Error("[oracle-store] Admin keypair file missing in production.");
+    }
   } catch (error) {
+    if (inProd) {
+      throw error;
+    }
     console.warn("[oracle-store] Failed to load admin keypair, generating new one.", error);
   }
 
@@ -138,11 +163,19 @@ export class OracleStore {
   private nextMarketId: number = 0;
   private nextPositionId: number = 1000;
   private authority: string = resolveAdminAuthority();
+  private persistenceBackend: StoreBackend;
   private persistencePath?: string;
 
   constructor() {
-    this.persistencePath = resolvePersistencePath();
-    const snapshot = this.persistencePath ? loadSnapshot(this.persistencePath) : null;
+    this.persistenceBackend = resolveStoreBackend();
+    assertProductionPersistence(this.persistenceBackend);
+    this.persistencePath = resolvePersistencePath(this.persistenceBackend);
+    const snapshot =
+      this.persistenceBackend === "sqlite"
+        ? loadSnapshotFromDatabase()
+        : this.persistencePath
+          ? loadSnapshot(this.persistencePath)
+          : null;
     
     if (snapshot) {
       if (snapshot.version < CURRENT_STORE_VERSION) {
@@ -220,6 +253,11 @@ export class OracleStore {
   }
 
   private persistSnapshot() {
+    if (this.persistenceBackend === "sqlite") {
+      queueSnapshotSave(this.persistenceBackend, this.persistencePath, this.buildSnapshot());
+      return;
+    }
+
     if (!this.persistencePath) {
       if (!missingPersistenceWarned) {
         console.warn("[oracle-store] Persistence disabled. Set ORACLE_STORE_PATH in production to avoid data loss.");
@@ -227,7 +265,7 @@ export class OracleStore {
       }
       return;
     }
-    queueSnapshotSave(this.persistencePath, this.buildSnapshot());
+    queueSnapshotSave(this.persistenceBackend, this.persistencePath, this.buildSnapshot());
   }
 
   getRegistryAuthority(): string {
@@ -383,13 +421,103 @@ export class OracleStore {
   }
 }
 
-function resolvePersistencePath(): string | undefined {
+function resolveStoreBackend(): StoreBackend {
+  const configured = process.env[STORE_BACKEND_ENV]?.trim().toLowerCase();
+  if (configured === "file") return "file";
+  if (configured === "sqlite") return "sqlite";
+  return "sqlite";
+}
+
+function assertProductionPersistence(backend: StoreBackend): void {
+  if (process.env.NODE_ENV !== "production") return;
+  if (!process.env[STORE_BACKEND_ENV]) {
+    throw new Error("[oracle-store] ORACLE_STORE_BACKEND must be set in production.");
+  }
+  if (backend === "sqlite" && !process.env[DB_PATH_ENV]) {
+    throw new Error("[oracle-store] ORACLE_DB_PATH must be set for sqlite persistence in production.");
+  }
+  if (backend === "file" && !process.env[STORE_PATH_ENV]) {
+    throw new Error("[oracle-store] ORACLE_STORE_PATH must be set for file persistence in production.");
+  }
+}
+
+function resolvePersistencePath(backend: StoreBackend): string | undefined {
+  if (backend !== "file") return undefined;
   const configured = process.env[STORE_PATH_ENV]?.trim();
   if (configured) return resolve(configured);
   if (process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test") {
     return DEFAULT_STORE_PATH;
   }
-  return undefined;
+  return DEFAULT_STORE_PATH;
+}
+
+function resolveDatabasePath(): string {
+  const configured = process.env[DB_PATH_ENV]?.trim();
+  return resolve(configured || DEFAULT_DB_PATH);
+}
+
+function getDatabase(): Database {
+  if (!database) {
+    const dbPath = resolveDatabasePath();
+    mkdirSync(dirname(dbPath), { recursive: true });
+    try {
+      database = new Database(dbPath);
+    } catch (error) {
+      console.error("[oracle-store] Failed to open sqlite database.", error);
+      throw new Error("[oracle-store] SQLite backend unavailable. Install better-sqlite3 or switch ORACLE_STORE_BACKEND=file.");
+    }
+    database.pragma("journal_mode = wal");
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS oracle_store (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        snapshot TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `);
+  }
+  return database;
+}
+
+function loadSnapshotFromDatabase(): StoreSnapshot | null {
+  try {
+    const db = getDatabase();
+    const row = db.prepare("SELECT snapshot FROM oracle_store WHERE id = 1").get() as { snapshot?: string } | undefined;
+    if (!row?.snapshot) return null;
+    const snapshot = JSON.parse(row.snapshot) as StoreSnapshot;
+
+    if (snapshot.checksum) {
+      const dataToHash = JSON.stringify({ ...snapshot, checksum: undefined });
+      const currentHash = createHash("sha256").update(dataToHash).digest("hex");
+      if (currentHash !== snapshot.checksum) {
+        console.error("[oracle-store] FATAL: Snapshot checksum mismatch. Possible tampering.");
+        process.exit(1);
+      }
+    }
+
+    return snapshot;
+  } catch (err) {
+    if (err instanceof SyntaxError) {
+      console.error("[oracle-store] FATAL: Store database is corrupt. Build aborted.");
+      process.exit(1);
+    }
+    console.error("[oracle-store] Failed to load snapshot from database.", err);
+    return null;
+  }
+}
+
+function saveSnapshotToDatabase(snapshot: StoreSnapshot): void {
+  try {
+    const db = getDatabase();
+    const dataToHash = JSON.stringify({ ...snapshot, checksum: undefined });
+    snapshot.checksum = createHash("sha256").update(dataToHash).digest("hex");
+    const payload = JSON.stringify(snapshot);
+    db.prepare("INSERT OR REPLACE INTO oracle_store (id, snapshot, updated_at) VALUES (1, ?, ?)").run(
+      payload,
+      new Date().toISOString()
+    );
+  } catch (error) {
+    console.error("[oracle-store] Failed to persist snapshot to database.", error);
+  }
 }
 
 function loadSnapshot(path: string): StoreSnapshot | null {
@@ -417,15 +545,27 @@ function loadSnapshot(path: string): StoreSnapshot | null {
   }
 }
 
-function queueSnapshotSave(path: string, snapshot: StoreSnapshot): void {
+function queueSnapshotSave(backend: StoreBackend, path: string | undefined, snapshot: StoreSnapshot): void {
   pendingSnapshot = snapshot;
+  pendingBackend = backend;
+  pendingPath = path;
   if (persistTimer) return;
   persistTimer = setTimeout(() => {
     const snapshotToSave = pendingSnapshot;
+    const backendToUse = pendingBackend;
+    const pathToUse = pendingPath;
     pendingSnapshot = null;
+    pendingBackend = null;
+    pendingPath = undefined;
     persistTimer = null;
-    if (!snapshotToSave) return;
-    void saveSnapshot(path, snapshotToSave);
+    if (!snapshotToSave || !backendToUse) return;
+    if (backendToUse === "sqlite") {
+      saveSnapshotToDatabase(snapshotToSave);
+      return;
+    }
+    if (pathToUse) {
+      void saveSnapshot(pathToUse, snapshotToSave);
+    }
   }, SNAPSHOT_DEBOUNCE_MS);
 }
 
@@ -449,12 +589,11 @@ export function normalizeWallet(wallet: string | string[] | undefined): string |
   const value = Array.isArray(wallet) ? wallet[0] : wallet;
   if (!value) return undefined;
   const trimmed = value.trim();
-  return WALLET_PATTERN.test(trimmed) ? trimmed : undefined;
-}
-
-export function isValidWalletAddress(wallet: string | undefined): boolean {
-  if (!wallet) return false;
-  return WALLET_PATTERN.test(wallet);
+  if (!trimmed) return undefined;
+  if (!WALLET_PATTERN.test(trimmed)) {
+    throw new Error("Invalid wallet address.");
+  }
+  return trimmed;
 }
 
 type GlobalWithStore = typeof globalThis & { __oracleStore?: OracleStore };
