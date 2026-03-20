@@ -14,7 +14,6 @@ const INVALID_REASON_CODES: InvalidMarketReasonCode[] = [
   "SETTLEMENT_MANIPULATION",
   "FORCE_MAJEURE_EVENT",
 ];
-const BODY_LIMIT = "64kb";
 
 export const config = {
   api: {
@@ -47,7 +46,7 @@ function parseSlashBps(value: unknown): number | undefined {
   return Math.max(50, Math.min(2_000, Math.round(value)));
 }
 
-export default function handler(req: NextApiRequest, res: NextApiResponse) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
     res.setHeader("Allow", ["POST"]);
     res.status(405).json({ error: `Method ${req.method ?? "UNKNOWN"} Not Allowed` });
@@ -56,18 +55,24 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
 
   if (!requireJson(req, res)) return;
   if (
-    !enforceRateLimit(req, res, {
+    !(await enforceRateLimit(req, res, {
       key: rateLimitKey(req, "disputes:resolve"),
       limit: 6,
       windowMs: 60 * 60 * 1000,
-    })
+    }))
   ) {
     return;
   }
 
   const disputeId = parseDisputeId(req.query.id);
   const walletRaw = typeof req.body?.wallet === "string" ? req.body.wallet.trim() : "";
-  const resolvedBy = normalizeWallet(walletRaw);
+  let resolvedBy: string | undefined;
+  try {
+    resolvedBy = normalizeWallet(walletRaw);
+  } catch {
+    res.status(400).json({ error: "Invalid wallet address." });
+    return;
+  }
   const outcome = parseOutcome(req.body?.outcome);
   const invalidReasonCode = parseInvalidReasonCode(req.body?.invalidReasonCode);
   const slashBps = parseSlashBps(req.body?.slashBps);
@@ -93,11 +98,11 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     return;
   }
   if (
-    !requireWalletAuth(req, res, {
+    !(await requireWalletAuth(req, res, {
       wallet: resolvedBy,
       action: "disputes:resolve",
       auth,
-    })
+    }))
   ) {
     return;
   }
