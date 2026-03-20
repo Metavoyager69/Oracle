@@ -25,6 +25,8 @@
     "@solana/wallet-adapter-react-ui": "^0.9.35",
     "@solana/wallet-adapter-solflare": "^0.6.32",
     "@solana/web3.js": "^1.92.2",
+    "@upstash/redis": "^1.36.0",
+    "better-sqlite3": "^11.10.0",
     "bn.js": "^5.2.1",
     "date-fns": "^3.6.0",
     "framer-motion": "^11.2.10",
@@ -35,6 +37,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2",
+    "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
