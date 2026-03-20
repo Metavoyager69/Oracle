@@ -1,8 +1,9 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { PublicKey } from "@solana/web3.js";
 import nacl from "tweetnacl";
-import { buildWalletAuthMessage, isWalletAuthFresh } from "../../utils/wallet-auth";
+import { WALLET_AUTH_TTL_MS, buildWalletAuthMessage, isWalletAuthFresh } from "../../utils/wallet-auth";
 import { store } from "./store";
+import { getRedisClient } from "./redis";
 
 // [OBSERVABILITY UPGRADE] - Structured Logging helper
 function log(level: string, message: string, data: any = {}) {
@@ -29,10 +30,13 @@ type WalletAuthPayload = {
   message?: string;
   signature?: string;
   timestamp?: string;
+  nonce?: string;
 };
 
 const buckets = new Map<string, RateLimitState>();
 const MAX_BUCKETS = 10_000;
+const nonceCache = new Map<string, number>();
+const MAX_NONCE_CACHE = 25_000;
 
 // [ISSUE 18 FIX] - Hardened IP detection. Only trust X-Forwarded-For in production (Vercel).
 export function getClientIp(req: NextApiRequest): string {
@@ -50,7 +54,7 @@ export function rateLimitKey(req: NextApiRequest, scope: string): string {
   return `${scope}:${getClientIp(req)}`;
 }
 
-export function enforceRateLimit(
+function enforceRateLimitMemory(
   req: NextApiRequest,
   res: NextApiResponse,
   options: RateLimitOptions
@@ -93,8 +97,58 @@ export function enforceRateLimit(
   return true;
 }
 
+export async function enforceRateLimit(
+  req: NextApiRequest,
+  res: NextApiResponse,
+  options: RateLimitOptions
+): Promise<boolean> {
+  const redis = getRedisClient();
+  if (!redis) {
+    if (process.env.NODE_ENV === "production") {
+      log("CRITICAL", "Redis not configured for rate limiting", { key: options.key });
+      res.status(503).json({ error: "Rate limiter unavailable. Configure Upstash Redis." });
+      return false;
+    }
+    return enforceRateLimitMemory(req, res, options);
+  }
+
+  const now = Date.now();
+  const redisKey = `oracle:ratelimit:${options.key}`;
+
+  try {
+    const count = await redis.incr(redisKey);
+    if (count === 1) {
+      await redis.expire(redisKey, Math.ceil(options.windowMs / 1000));
+    }
+
+    let ttlSeconds = await redis.ttl(redisKey);
+    if (!ttlSeconds || ttlSeconds < 0) {
+      ttlSeconds = Math.ceil(options.windowMs / 1000);
+    }
+    const resetAt = now + ttlSeconds * 1000;
+    const remaining = Math.max(0, options.limit - count);
+
+    res.setHeader("X-RateLimit-Limit", options.limit.toString());
+    res.setHeader("X-RateLimit-Remaining", remaining.toString());
+    res.setHeader("X-RateLimit-Reset", Math.ceil(resetAt / 1000).toString());
+
+    if (count > options.limit) {
+      log("WARN", "Rate limit exceeded", { key: options.key, limit: options.limit });
+      const retryAfter = Math.max(1, Math.ceil((resetAt - now) / 1000));
+      res.setHeader("Retry-After", retryAfter.toString());
+      res.status(429).json({ error: "Rate limit exceeded. Please retry shortly." });
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    log("ERROR", "Redis rate limit failed, falling back to memory", { error: String(error) });
+    return enforceRateLimitMemory(req, res, options);
+  }
+}
+
 // [ISSUES 21 & 22 FIX] - Protect internal API endpoints
-export function requireAdminAuth(req: NextApiRequest, res: NextApiResponse): boolean {
+export async function requireAdminAuth(req: NextApiRequest, res: NextApiResponse): Promise<boolean> {
   const adminWallet = store.getRegistryAuthority();
   const walletInput = req.headers["x-admin-wallet"] as string;
   const authHeader = req.headers["x-admin-auth"] as string;
@@ -106,7 +160,7 @@ export function requireAdminAuth(req: NextApiRequest, res: NextApiResponse): boo
 
   try {
     const auth = JSON.parse(authHeader);
-    return requireWalletAuth(req, res, { 
+    return await requireWalletAuth(req, res, { 
       wallet: walletInput, 
       action: "admin:access", 
       auth 
@@ -134,13 +188,51 @@ function decodeBase64(value: string): Uint8Array | null {
   }
 }
 
-export function requireWalletAuth(
+type NonceResult = "ok" | "replay" | "unavailable";
+
+async function consumeNonce(wallet: string, nonce: string): Promise<NonceResult> {
+  const redis = getRedisClient();
+  const key = `oracle:auth:nonce:${wallet}:${nonce}`;
+
+  if (redis) {
+    try {
+      const result = await redis.set(key, "1", { nx: true, px: WALLET_AUTH_TTL_MS });
+      return result === "OK" ? "ok" : "replay";
+    } catch (error) {
+      log("ERROR", "Redis nonce store failed, falling back to memory", { error: String(error) });
+    }
+  }
+
+  if (process.env.NODE_ENV === "production") {
+    log("CRITICAL", "Redis not configured for nonce storage", { wallet });
+    return "unavailable";
+  }
+
+  const now = Date.now();
+  const existing = nonceCache.get(key);
+  if (existing && existing > now) {
+    return "replay";
+  }
+  nonceCache.set(key, now + WALLET_AUTH_TTL_MS);
+
+  if (nonceCache.size > MAX_NONCE_CACHE) {
+    for (const [nonceKey, expiresAt] of nonceCache.entries()) {
+      if (expiresAt <= now) {
+        nonceCache.delete(nonceKey);
+      }
+    }
+  }
+
+  return "ok";
+}
+
+export async function requireWalletAuth(
   req: NextApiRequest,
   res: NextApiResponse,
   options: { wallet: string; action: string; auth: WalletAuthPayload | undefined }
-): boolean {
+): Promise<boolean> {
   const auth = options.auth;
-  if (!auth?.message || !auth?.signature || !auth?.timestamp) {
+  if (!auth?.message || !auth?.signature || !auth?.timestamp || !auth?.nonce) {
     log("ERROR", "Wallet auth missing fields", { wallet: options.wallet, action: options.action });
     res.status(401).json({ error: "Wallet signature required." });
     return false;
@@ -152,7 +244,7 @@ export function requireWalletAuth(
     return false;
   }
 
-  const expectedMessage = buildWalletAuthMessage(options.action, options.wallet, auth.timestamp);
+  const expectedMessage = buildWalletAuthMessage(options.action, options.wallet, auth.timestamp, auth.nonce);
   if (auth.message !== expectedMessage) {
     log("ERROR", "Wallet auth message mismatch", { wallet: options.wallet, action: options.action });
     res.status(401).json({ error: "Wallet signature message mismatch." });
@@ -178,6 +270,17 @@ export function requireWalletAuth(
   if (!isValid) {
     log("CRITICAL", "Wallet signature verification failed", { wallet: options.wallet, action: options.action });
     res.status(401).json({ error: "Wallet signature verification failed." });
+    return false;
+  }
+
+  const nonceResult = await consumeNonce(options.wallet, auth.nonce);
+  if (nonceResult === "unavailable") {
+    res.status(503).json({ error: "Wallet auth unavailable. Configure nonce storage." });
+    return false;
+  }
+  if (nonceResult === "replay") {
+    log("WARN", "Wallet auth replay detected", { wallet: options.wallet, action: options.action });
+    res.status(401).json({ error: "Wallet signature replay detected. Please retry." });
     return false;
   }
 
