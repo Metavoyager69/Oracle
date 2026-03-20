@@ -30,12 +30,16 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
 
   const walletRaw = Array.isArray(req.query.wallet) ? req.query.wallet[0] : req.query.wallet;
-  const walletScope = walletRaw ? normalizeWallet(walletRaw) : undefined;
-  // Reject malformed wallet scopes to prevent accidental data leaks.
-  if (walletRaw && !walletScope) {
-    res.status(400).json({ error: "Invalid wallet filter." });
-    return;
+  let walletScope: string | undefined;
+  if (walletRaw) {
+    try {
+      walletScope = normalizeWallet(walletRaw);
+    } catch {
+      res.status(400).json({ error: "Invalid wallet filter." });
+      return;
+    }
   }
+  // Reject malformed wallet scopes to prevent accidental data leaks.
   const hasWalletScope = Boolean(walletScope);
   // Without a valid wallet, history is intentionally hidden.
   const history = hasWalletScope
