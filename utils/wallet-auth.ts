@@ -1,7 +1,12 @@
 export const WALLET_AUTH_TTL_MS = 2 * 60 * 1000;
 
-export function buildWalletAuthMessage(action: string, wallet: string, timestamp: string): string {
-  return `Oracle auth\nAction: ${action}\nWallet: ${wallet}\nTimestamp: ${timestamp}`;
+export function buildWalletAuthMessage(
+  action: string,
+  wallet: string,
+  timestamp: string,
+  nonce: string
+): string {
+  return `Oracle auth\nAction: ${action}\nWallet: ${wallet}\nTimestamp: ${timestamp}\nNonce: ${nonce}`;
 }
 
 export function parseWalletAuthTimestamp(value: string): number | null {
