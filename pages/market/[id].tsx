@@ -12,13 +12,14 @@ import {
   encryptChoice,
   commitStake,
 } from "../../utils/arcium";
+import { storeStakeNonce } from "../../utils/nonce-vault";
 
 type StepState = "idle" | "encrypting" | "submitting" | "confirmed" | "error";
 
 export default function MarketPage() {
   const router = useRouter();
   const { id } = router.query;
-  const { connected } = useWallet();
+  const { connected, publicKey, signMessage } = useWallet();
   const anchorWallet = useAnchorWallet();
   const { connection } = useConnection();
   const provider = anchorWallet
@@ -67,12 +68,12 @@ export default function MarketPage() {
       //    so the Arcium relayer can call reveal_position and verify the hash.
       const { commitment, stakeNonce } = await commitStake(stakeLamports);
 
-      // In production: store stakeNonce in user's wallet adapter or local
-      // encrypted storage so the relayer can retrieve it at settlement.
-      // For demo: log nonce to console (DO NOT do this in production).
-      console.info(
-        "STAKE NONCE (keep secret until settlement):",
-        Buffer.from(stakeNonce).toString("hex")
+      // Store nonce in encrypted local storage derived from the wallet signature.
+      await storeStakeNonce(
+        { connected, publicKey, signMessage },
+        market.id,
+        commitment,
+        stakeNonce
       );
 
       // Preview the ciphertext (first 8 bytes of c1 for UI)
