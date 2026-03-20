@@ -10,7 +10,6 @@ const EVIDENCE_SOURCE_TYPES: EvidenceSourceType[] = [
   "OnChainEvent",
   "Other",
 ];
-const BODY_LIMIT = "64kb";
 
 export const config = {
   api: {
@@ -33,7 +32,7 @@ function parseEvidenceSourceType(value: unknown): EvidenceSourceType | undefined
     : undefined;
 }
 
-export default function handler(req: NextApiRequest, res: NextApiResponse) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const marketId = parseMarketId(req.query.id);
   if (Number.isNaN(marketId)) {
     res.status(400).json({ error: "Invalid market id." });
@@ -81,17 +80,23 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method === "POST") {
     if (!requireJson(req, res)) return;
     if (
-      !enforceRateLimit(req, res, {
+      !(await enforceRateLimit(req, res, {
         key: rateLimitKey(req, "disputes:open"),
         limit: 8,
         windowMs: 60 * 60 * 1000,
-      })
+      }))
     ) {
       return;
     }
 
     const walletRaw = typeof req.body?.wallet === "string" ? req.body.wallet.trim() : "";
-    const wallet = normalizeWallet(walletRaw);
+    let wallet: string | undefined;
+    try {
+      wallet = normalizeWallet(walletRaw);
+    } catch {
+      res.status(400).json({ error: "Invalid wallet address." });
+      return;
+    }
     const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
     const evidenceSummary =
       typeof req.body?.evidenceSummary === "string" ? req.body.evidenceSummary.trim() : "";
@@ -117,11 +122,11 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
       return;
     }
     if (
-      !requireWalletAuth(req, res, {
+      !(await requireWalletAuth(req, res, {
         wallet,
         action: "disputes:open",
         auth,
-      })
+      }))
     ) {
       return;
     }
