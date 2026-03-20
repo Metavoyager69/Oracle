@@ -108,6 +108,16 @@ export interface SubmitPositionInput {
   encryptedChoice?: { c1: number[]; c2: number[] };
 }
 
+export interface RelayRevealInput {
+  marketId: number;
+  yesTotal: number;
+  noTotal: number;
+  relaySignature: string;
+  relayActor?: string;
+  slot?: number;
+  signature?: string;
+}
+
 function resolveAdminAuthority(): string {
   const inProd = process.env.NODE_ENV === "production";
   const explicit = process.env[ADMIN_WALLET_ENV]?.trim();
@@ -418,6 +428,31 @@ export class OracleStore {
     const dispute = this.disputeEngine.resolveDispute(input);
     this.persistSnapshot();
     return dispute;
+  }
+
+  recordRelayReveal(input: RelayRevealInput): StoredMarket {
+    const market = this.getMarketById(input.marketId);
+    if (!market) {
+      throw new Error("Market not found.");
+    }
+
+    market.revealedYesStake = input.yesTotal;
+    market.revealedNoStake = input.noTotal;
+    if (market.status === "Open") {
+      market.status = "SettledPending";
+    }
+
+    this.indexer.consumeEvent({
+      marketId: market.id,
+      type: "MARKET_STATUS_CHANGED",
+      actor: input.relayActor ?? "arcium-relay",
+      details: `Relay reveal submitted (${input.relaySignature.slice(0, 12)}...)`,
+      slot: input.slot ?? 0,
+      signature: input.signature ?? "RELAY",
+    });
+
+    this.persistSnapshot();
+    return market;
   }
 }
 
