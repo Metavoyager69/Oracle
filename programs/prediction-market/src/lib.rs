@@ -340,7 +340,14 @@ pub mod prediction_market {
         let pos = &mut ctx.accounts.position;
         let clock = Clock::get()?;
         let timed_out = clock.unix_timestamp > market.resolution_timestamp + LIVENESS_TIMEOUT_SECS;
-        require!(timed_out || market.status == MarketStatus::Cancelled || market.status == MarketStatus::Invalid, PredictionMarketError::Timeout);
+        let allowed_timeout = timed_out
+            && (market.status == MarketStatus::Open
+                || market.status == MarketStatus::SettledPending
+                || market.status == MarketStatus::Challenged);
+        require!(
+            allowed_timeout || market.status == MarketStatus::Cancelled || market.status == MarketStatus::Invalid,
+            PredictionMarketError::Timeout
+        );
         let mut preimage = [0u8; 40];
         preimage[..8].copy_from_slice(&stake.to_le_bytes());
         preimage[8..].copy_from_slice(&nonce);
