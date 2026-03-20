@@ -11,7 +11,6 @@ const EVIDENCE_SOURCE_TYPES: EvidenceSourceType[] = [
   "OnChainEvent",
   "Other",
 ];
-const BODY_LIMIT = "64kb";
 
 export const config = {
   api: {
@@ -33,7 +32,7 @@ function parseEvidenceSourceType(value: unknown): EvidenceSourceType | undefined
     : undefined;
 }
 
-export default function handler(req: NextApiRequest, res: NextApiResponse) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "POST") {
     res.setHeader("Allow", ["POST"]);
     res.status(405).json({ error: `Method ${req.method ?? "UNKNOWN"} Not Allowed` });
@@ -42,18 +41,24 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
 
   if (!requireJson(req, res)) return;
   if (
-    !enforceRateLimit(req, res, {
+    !(await enforceRateLimit(req, res, {
       key: rateLimitKey(req, "disputes:evidence"),
       limit: 20,
       windowMs: 60 * 60 * 1000,
-    })
+    }))
   ) {
     return;
   }
 
   const disputeId = parseDisputeId(req.query.id);
   const walletRaw = typeof req.body?.wallet === "string" ? req.body.wallet.trim() : "";
-  const submittedBy = normalizeWallet(walletRaw);
+  let submittedBy: string | undefined;
+  try {
+    submittedBy = normalizeWallet(walletRaw);
+  } catch {
+    res.status(400).json({ error: "Invalid wallet address." });
+    return;
+  }
   const summary = typeof req.body?.summary === "string" ? req.body.summary.trim() : "";
   const uri = typeof req.body?.uri === "string" ? req.body.uri.trim() : "";
   const sourceType = parseEvidenceSourceType(req.body?.sourceType);
@@ -80,11 +85,11 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
     return;
   }
   if (
-    !requireWalletAuth(req, res, {
+    !(await requireWalletAuth(req, res, {
       wallet: submittedBy,
       action: "disputes:evidence",
       auth,
-    })
+    }))
   ) {
     return;
   }
