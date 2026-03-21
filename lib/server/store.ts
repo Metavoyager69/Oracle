@@ -25,6 +25,7 @@ import {
   type ResolveDisputeInput,
   type SettlementDisputeRecord,
 } from "./services/dispute-engine";
+import { assertRuntimeConfig, isProdLike } from "./runtime-env";
 
 // [ISSUE 5 FIX] - Incremented version for new schema
 const CURRENT_STORE_VERSION = 3; 
@@ -42,12 +43,7 @@ const ADMIN_WALLET_ENV = "ORACLE_ADMIN_WALLET";
 const ADMIN_KEYPAIR_PATH_ENV = "ORACLE_ADMIN_KEYPAIR_PATH";
 const DEFAULT_ADMIN_KEYPAIR_PATH = resolve(PROJECT_ROOT, "data", "oracle-admin-keypair.json");
 type StoreBackend = "sqlite" | "file";
-
-function isProdLike(): boolean {
-  const nodeEnv = process.env.NODE_ENV?.toLowerCase();
-  const vercelEnv = process.env.VERCEL_ENV?.toLowerCase();
-  return nodeEnv === "production" || vercelEnv === "production";
-}
+assertRuntimeConfig();
 
 let pendingSnapshot: StoreSnapshot | null = null;
 let pendingBackend: StoreBackend | null = null;
