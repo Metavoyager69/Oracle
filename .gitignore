@@ -16,6 +16,7 @@ out/
 # Keys - NEVER commit these
 *.json
 !package.json
+!package-lock.json
 !programs/*/Cargo.toml
 !tsconfig.json
 !Anchor.toml
