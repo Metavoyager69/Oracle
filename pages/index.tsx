@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import Head from "next/head";
+import Link from "next/link";
 import Navbar from "../components/Navbar";
 import MarketCard from "../components/MarketCard";
 import { DEMO_MARKETS } from "../utils/program";
@@ -81,7 +82,7 @@ export default function Home() {
             <p className="font-body text-slate-400 text-base max-w-xl mx-auto mb-8 leading-relaxed">
               The first prediction market where{" "}
               <span style={{ color: "#C084FC" }}>stakes, votes, and resolution inputs</span>{" "}
-              remain encrypted on-chain. Arcium's Multi-Party Computation reveals outcomes
+              remain encrypted on-chain. Arcium&apos;s Multi-Party Computation reveals outcomes
               while hiding individual positions — forever eliminating herding and manipulation.
             </p>
 
@@ -89,9 +90,9 @@ export default function Home() {
               <a href="#markets" className="btn-primary">
                 Browse Markets
               </a>
-              <a href="/create" className="btn-secondary">
+              <Link href="/create" className="btn-secondary">
                 Create Market
-              </a>
+              </Link>
             </div>
           </div>
         </section>
