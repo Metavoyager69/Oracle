@@ -637,6 +637,27 @@ export class OracleStore {
     );
   }
 
+  private recordProbabilityPoint(marketId: number, yesTotal: number, noTotal: number): void {
+    if (this.persistenceBackend !== "sqlite") return;
+    const yes = Number.isFinite(yesTotal) ? Math.max(0, yesTotal) : 0;
+    const no = Number.isFinite(noTotal) ? Math.max(0, noTotal) : 0;
+    const total = yes + no;
+    const yesProbability = total > 0 ? yes / total : 0.5;
+    const noProbability = total > 0 ? no / total : 0.5;
+    const volumeSol = total;
+    const db = getDatabase();
+    db.prepare(
+      `INSERT INTO probability_history (market_id, timestamp, yes_probability, no_probability, volume_sol)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(
+      marketId,
+      new Date().toISOString(),
+      yesProbability,
+      noProbability,
+      volumeSol
+    );
+  }
+
   private persistFullStateToDatabase(): void {
     if (this.persistenceBackend !== "sqlite") return;
     const db = getDatabase();
@@ -684,8 +705,38 @@ export class OracleStore {
         "DELETE FROM markets; DELETE FROM positions; DELETE FROM disputes; DELETE FROM dispute_evidence; DELETE FROM indexer_events; DELETE FROM audit_log; DELETE FROM probability_history;"
       );
 
-      snapshot.markets.forEach((market) => this.persistMarketToDatabase(market));
-      snapshot.positions.forEach((position) => this.persistPositionToDatabase(position));
+      snapshot.markets.forEach((market) => {
+        insertMarket.run(
+          market.id,
+          market.creator,
+          market.title,
+          market.description,
+          market.resolutionTimestamp,
+          market.category,
+          market.status,
+          market.totalParticipants,
+          JSON.stringify(market.rules ?? []),
+          market.resolutionSource,
+          typeof market.outcome === "boolean" ? Number(market.outcome) : null,
+          market.revealedYesStake ?? null,
+          market.revealedNoStake ?? null,
+          market.version
+        );
+      });
+
+      snapshot.positions.forEach((position) => {
+        insertPosition.run(
+          position.id,
+          position.marketId,
+          position.wallet,
+          position.commitment,
+          serializeCipher(position.encryptedStake),
+          serializeCipher(position.encryptedChoice),
+          position.submittedAt.toISOString(),
+          position.claimed ? 1 : 0,
+          position.version
+        );
+      });
 
       disputeSnapshot.disputes.forEach((dispute) => {
         insertDispute.run(
@@ -988,6 +1039,7 @@ export class OracleStore {
       signature: input.signature ?? "RELAY",
     });
     if (this.persistenceBackend === "sqlite") {
+      this.recordProbabilityPoint(market.id, input.yesTotal, input.noTotal);
       this.persistMarketToDatabase(market);
       this.persistLatestAuditEntry();
       this.persistMeta();
@@ -1310,6 +1362,7 @@ function migrateLegacySnapshotIfNeeded(db: Database): void {
   const legacySnapshot = loadLegacySnapshotFromDatabase(db);
   if (!legacySnapshot) return;
   importLegacySnapshot(db, legacySnapshot);
+  db.exec("DROP TABLE IF EXISTS oracle_store");
 }
 
 function loadLegacySnapshotFromDatabase(db: Database): StoreSnapshot | null {
