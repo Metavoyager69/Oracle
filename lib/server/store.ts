@@ -43,6 +43,12 @@ const ADMIN_KEYPAIR_PATH_ENV = "ORACLE_ADMIN_KEYPAIR_PATH";
 const DEFAULT_ADMIN_KEYPAIR_PATH = resolve(PROJECT_ROOT, "data", "oracle-admin-keypair.json");
 type StoreBackend = "sqlite" | "file";
 
+function isProdLike(): boolean {
+  const nodeEnv = process.env.NODE_ENV?.toLowerCase();
+  const vercelEnv = process.env.VERCEL_ENV?.toLowerCase();
+  return nodeEnv === "production" || vercelEnv === "production";
+}
+
 let pendingSnapshot: StoreSnapshot | null = null;
 let pendingBackend: StoreBackend | null = null;
 let pendingPath: string | undefined;
@@ -119,7 +125,7 @@ export interface RelayRevealInput {
 }
 
 function resolveAdminAuthority(): string {
-  const inProd = process.env.NODE_ENV === "production";
+  const inProd = isProdLike();
   const explicit = process.env[ADMIN_WALLET_ENV]?.trim();
   if (explicit) {
     if (!WALLET_PATTERN.test(explicit)) {
@@ -458,13 +464,20 @@ export class OracleStore {
 
 function resolveStoreBackend(): StoreBackend {
   const configured = process.env[STORE_BACKEND_ENV]?.trim().toLowerCase();
-  if (configured === "file") return "file";
-  if (configured === "sqlite") return "sqlite";
-  return "sqlite";
+  if (!configured) {
+    if (isProdLike()) {
+      throw new Error("[oracle-store] ORACLE_STORE_BACKEND must be set to 'sqlite' or 'file' in production.");
+    }
+    return "sqlite";
+  }
+  if (configured !== "file" && configured !== "sqlite") {
+    throw new Error("[oracle-store] ORACLE_STORE_BACKEND must be 'sqlite' or 'file'.");
+  }
+  return configured;
 }
 
 function assertProductionPersistence(backend: StoreBackend): void {
-  if (process.env.NODE_ENV !== "production") return;
+  if (!isProdLike()) return;
   if (!process.env[STORE_BACKEND_ENV]) {
     throw new Error("[oracle-store] ORACLE_STORE_BACKEND must be set in production.");
   }
@@ -480,10 +493,10 @@ function resolvePersistencePath(backend: StoreBackend): string | undefined {
   if (backend !== "file") return undefined;
   const configured = process.env[STORE_PATH_ENV]?.trim();
   if (configured) return resolve(configured);
-  if (process.env.NODE_ENV === "development" || process.env.NODE_ENV === "test") {
+  if (!isProdLike()) {
     return DEFAULT_STORE_PATH;
   }
-  return DEFAULT_STORE_PATH;
+  throw new Error("[oracle-store] ORACLE_STORE_PATH must be set for file persistence in production.");
 }
 
 function resolveDatabasePath(): string {
