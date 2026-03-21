@@ -42,6 +42,7 @@ const WALLET_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const ADMIN_WALLET_ENV = "ORACLE_ADMIN_WALLET";
 const ADMIN_KEYPAIR_PATH_ENV = "ORACLE_ADMIN_KEYPAIR_PATH";
 const DEFAULT_ADMIN_KEYPAIR_PATH = resolve(PROJECT_ROOT, "data", "oracle-admin-keypair.json");
+const DB_SCHEMA_VERSION = 1;
 type StoreBackend = "sqlite" | "file";
 assertRuntimeConfig();
 
@@ -51,6 +52,188 @@ let pendingPath: string | undefined;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let missingPersistenceWarned = false;
 let database: Database | null = null;
+
+type MetaRecord = Record<string, string>;
+
+function safeJsonParse<T>(value: string | null | undefined, fallback: T): T {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function serializeCipher(
+  cipher?: { c1: number[]; c2: number[] }
+): string | null {
+  if (!cipher) return null;
+  return JSON.stringify(cipher);
+}
+
+function deserializeCipher(
+  value: string | null
+): { c1: number[]; c2: number[] } | undefined {
+  if (!value) return undefined;
+  const parsed = safeJsonParse<{ c1?: unknown; c2?: unknown }>(value, {});
+  if (!Array.isArray(parsed.c1) || !Array.isArray(parsed.c2)) return undefined;
+  return {
+    c1: parsed.c1.filter((item): item is number => typeof item === "number"),
+    c2: parsed.c2.filter((item): item is number => typeof item === "number"),
+  };
+}
+
+function ensureSchema(db: Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS oracle_meta (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS markets (
+      id INTEGER PRIMARY KEY,
+      creator TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL,
+      resolution_timestamp TEXT NOT NULL,
+      category TEXT NOT NULL,
+      status TEXT NOT NULL,
+      total_participants INTEGER NOT NULL,
+      rules TEXT NOT NULL,
+      resolution_source TEXT NOT NULL,
+      outcome INTEGER,
+      revealed_yes_stake REAL,
+      revealed_no_stake REAL,
+      version INTEGER NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_markets_status ON markets(status);
+    CREATE INDEX IF NOT EXISTS idx_markets_category ON markets(category);
+
+    CREATE TABLE IF NOT EXISTS positions (
+      id INTEGER PRIMARY KEY,
+      market_id INTEGER NOT NULL,
+      wallet TEXT NOT NULL,
+      commitment TEXT NOT NULL,
+      encrypted_stake TEXT,
+      encrypted_choice TEXT,
+      submitted_at TEXT NOT NULL,
+      claimed INTEGER NOT NULL,
+      version INTEGER NOT NULL,
+      FOREIGN KEY (market_id) REFERENCES markets(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_positions_market ON positions(market_id);
+    CREATE INDEX IF NOT EXISTS idx_positions_wallet ON positions(wallet);
+
+    CREATE TABLE IF NOT EXISTS disputes (
+      id TEXT PRIMARY KEY,
+      market_id INTEGER NOT NULL,
+      submitted_by TEXT NOT NULL,
+      contested_resolver TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      settlement_stake_at_risk_sol REAL NOT NULL,
+      challenge_opened_at TEXT NOT NULL,
+      challenge_deadline_at TEXT NOT NULL,
+      challenge_closed_at TEXT,
+      resolution_outcome TEXT,
+      resolution_resolved_by TEXT,
+      resolution_note TEXT,
+      resolution_resolved_at TEXT,
+      slash_bps INTEGER,
+      slash_amount_sol REAL,
+      slashed_resolver TEXT,
+      slash_beneficiary TEXT,
+      slash_reason TEXT,
+      slash_applied_at TEXT,
+      invalid_reason_code TEXT,
+      invalid_rationale TEXT,
+      invalid_refund_mode TEXT,
+      invalid_decided_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS dispute_evidence (
+      id TEXT PRIMARY KEY,
+      dispute_id TEXT NOT NULL,
+      submitted_by TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      uri TEXT,
+      source_type TEXT NOT NULL,
+      source_domain TEXT,
+      evidence_hash TEXT NOT NULL,
+      verification_status TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (dispute_id) REFERENCES disputes(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_dispute_evidence_dispute ON dispute_evidence(dispute_id);
+
+    CREATE TABLE IF NOT EXISTS indexer_events (
+      id TEXT PRIMARY KEY,
+      slot INTEGER NOT NULL,
+      signature TEXT NOT NULL,
+      market_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      details TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+      id TEXT PRIMARY KEY,
+      slot INTEGER NOT NULL,
+      signature TEXT NOT NULL,
+      market_id INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      timestamp TEXT NOT NULL,
+      details TEXT NOT NULL,
+      integrity_hash TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS probability_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      market_id INTEGER NOT NULL,
+      timestamp TEXT NOT NULL,
+      yes_probability REAL NOT NULL,
+      no_probability REAL NOT NULL,
+      volume_sol REAL NOT NULL
+    );
+  `);
+}
+
+function readMeta(db: Database): MetaRecord {
+  const rows = db.prepare("SELECT key, value FROM oracle_meta").all() as Array<{ key: string; value: string }>;
+  return rows.reduce<MetaRecord>((acc, row) => {
+    acc[row.key] = row.value;
+    return acc;
+  }, {});
+}
+
+function writeMeta(db: Database, entries: MetaRecord): void {
+  const stmt = db.prepare("INSERT OR REPLACE INTO oracle_meta (key, value) VALUES (?, ?)");
+  const tx = db.transaction(() => {
+    Object.entries(entries).forEach(([key, value]) => {
+      stmt.run(key, value);
+    });
+  });
+  tx();
+}
+
+function nextSequenceId(ids: string[], prefix: string): number {
+  let max = 0;
+  for (const id of ids) {
+    if (!id.startsWith(prefix)) continue;
+    const numeric = Number.parseInt(id.slice(prefix.length), 10);
+    if (Number.isFinite(numeric)) {
+      max = Math.max(max, numeric);
+    }
+  }
+  return max + 1;
+}
 
 // [ISSUES 1, 2, 3, 4 FIX] - Strict typing for all data structures
 export interface StoredMarket {
@@ -184,7 +367,7 @@ export class OracleStore {
     this.persistencePath = resolvePersistencePath(this.persistenceBackend);
     const snapshot =
       this.persistenceBackend === "sqlite"
-        ? loadSnapshotFromDatabase()
+        ? loadNormalizedStateFromDatabase()
         : this.persistencePath
           ? loadSnapshot(this.persistencePath)
           : null;
@@ -196,6 +379,10 @@ export class OracleStore {
       this.applySnapshot(snapshot);
     } else {
       this.seedDemoData();
+    }
+
+    if (this.persistenceBackend === "sqlite") {
+      this.persistMeta();
     }
   }
 
@@ -233,7 +420,11 @@ export class OracleStore {
       });
     }
     
-    this.persistSnapshot();
+    if (this.persistenceBackend === "sqlite") {
+      this.persistFullStateToDatabase();
+    } else {
+      this.persistSnapshot();
+    }
   }
 
   private applySnapshot(snapshot: StoreSnapshot) {
@@ -269,10 +460,9 @@ export class OracleStore {
 
   private persistSnapshot() {
     if (this.persistenceBackend === "sqlite") {
-      queueSnapshotSave(this.persistenceBackend, this.persistencePath, this.buildSnapshot());
+      this.persistMeta();
       return;
     }
-
     if (!this.persistencePath) {
       if (!missingPersistenceWarned) {
         console.warn("[oracle-store] Persistence disabled. Set ORACLE_STORE_PATH in production to avoid data loss.");
@@ -281,6 +471,304 @@ export class OracleStore {
       return;
     }
     queueSnapshotSave(this.persistenceBackend, this.persistencePath, this.buildSnapshot());
+  }
+
+  private persistMeta() {
+    if (this.persistenceBackend !== "sqlite") return;
+    const db = getDatabase();
+    const disputeSnapshot = this.disputeEngine.snapshot();
+    const indexerSnapshot = this.indexer.snapshot();
+    writeMeta(db, {
+      schema_version: String(DB_SCHEMA_VERSION),
+      next_market_id: String(this.nextMarketId),
+      next_position_id: String(this.nextPositionId),
+      next_dispute_id: String(disputeSnapshot.nextDisputeId),
+      next_event_id: String(indexerSnapshot.nextEventId),
+      authority: this.authority,
+    });
+  }
+
+  private persistMarketToDatabase(market: StoredMarket): void {
+    if (this.persistenceBackend !== "sqlite") return;
+    const db = getDatabase();
+    db.prepare(
+      `INSERT OR REPLACE INTO markets
+      (id, creator, title, description, resolution_timestamp, category, status, total_participants, rules, resolution_source, outcome, revealed_yes_stake, revealed_no_stake, version)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      market.id,
+      market.creator,
+      market.title,
+      market.description,
+      market.resolutionTimestamp,
+      market.category,
+      market.status,
+      market.totalParticipants,
+      JSON.stringify(market.rules ?? []),
+      market.resolutionSource,
+      typeof market.outcome === "boolean" ? Number(market.outcome) : null,
+      market.revealedYesStake ?? null,
+      market.revealedNoStake ?? null,
+      market.version
+    );
+  }
+
+  private persistPositionToDatabase(position: StoredPosition): void {
+    if (this.persistenceBackend !== "sqlite") return;
+    const db = getDatabase();
+    db.prepare(
+      `INSERT OR REPLACE INTO positions
+       (id, market_id, wallet, commitment, encrypted_stake, encrypted_choice, submitted_at, claimed, version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      position.id,
+      position.marketId,
+      position.wallet,
+      position.commitment,
+      serializeCipher(position.encryptedStake),
+      serializeCipher(position.encryptedChoice),
+      position.submittedAt.toISOString(),
+      position.claimed ? 1 : 0,
+      position.version
+    );
+  }
+
+  private persistDisputeToDatabase(dispute: SettlementDisputeRecord): void {
+    if (this.persistenceBackend !== "sqlite") return;
+    const db = getDatabase();
+    const insertDispute = db.prepare(
+      `INSERT OR REPLACE INTO disputes
+       (id, market_id, submitted_by, contested_resolver, reason, status, created_at, updated_at, settlement_stake_at_risk_sol,
+        challenge_opened_at, challenge_deadline_at, challenge_closed_at,
+        resolution_outcome, resolution_resolved_by, resolution_note, resolution_resolved_at,
+        slash_bps, slash_amount_sol, slashed_resolver, slash_beneficiary, slash_reason, slash_applied_at,
+        invalid_reason_code, invalid_rationale, invalid_refund_mode, invalid_decided_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertEvidence = db.prepare(
+      `INSERT OR REPLACE INTO dispute_evidence
+       (id, dispute_id, submitted_by, summary, uri, source_type, source_domain, evidence_hash, verification_status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    const tx = db.transaction(() => {
+      insertDispute.run(
+        dispute.id,
+        dispute.marketId,
+        dispute.submittedBy,
+        dispute.contestedResolver,
+        dispute.reason,
+        dispute.status,
+        dispute.createdAt.toISOString(),
+        dispute.updatedAt.toISOString(),
+        dispute.settlementStakeAtRiskSol,
+        dispute.challengeWindow.openedAt.toISOString(),
+        dispute.challengeWindow.deadlineAt.toISOString(),
+        dispute.challengeWindow.closedAt ? dispute.challengeWindow.closedAt.toISOString() : null,
+        dispute.resolution?.outcome ?? null,
+        dispute.resolution?.resolvedBy ?? null,
+        dispute.resolution?.resolutionNote ?? null,
+        dispute.resolution?.resolvedAt ? dispute.resolution.resolvedAt.toISOString() : null,
+        dispute.slashing?.slashBps ?? null,
+        dispute.slashing?.slashAmountSol ?? null,
+        dispute.slashing?.slashedResolver ?? null,
+        dispute.slashing?.beneficiary ?? null,
+        dispute.slashing?.reason ?? null,
+        dispute.slashing?.appliedAt ? dispute.slashing.appliedAt.toISOString() : null,
+        dispute.invalidResolution?.reasonCode ?? null,
+        dispute.invalidResolution?.rationale ?? null,
+        dispute.invalidResolution?.refundMode ?? null,
+        dispute.invalidResolution?.decidedAt ? dispute.invalidResolution.decidedAt.toISOString() : null
+      );
+
+      db.prepare("DELETE FROM dispute_evidence WHERE dispute_id = ?").run(dispute.id);
+      dispute.evidence.forEach((evidence) => {
+        insertEvidence.run(
+          evidence.id,
+          dispute.id,
+          evidence.submittedBy,
+          evidence.summary,
+          evidence.uri ?? null,
+          evidence.sourceType,
+          evidence.sourceDomain ?? null,
+          evidence.evidenceHash,
+          evidence.verificationStatus,
+          evidence.createdAt.toISOString()
+        );
+      });
+    });
+
+    tx();
+  }
+
+  private persistLatestAuditEntry(): void {
+    if (this.persistenceBackend !== "sqlite") return;
+    const latest = this.indexer.listAuditLog(1)[0];
+    if (!latest) return;
+    const db = getDatabase();
+    db.prepare(
+      `INSERT OR REPLACE INTO indexer_events
+       (id, slot, signature, market_id, type, actor, timestamp, details)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      latest.id,
+      latest.slot,
+      latest.signature,
+      latest.marketId,
+      latest.type,
+      latest.actor,
+      latest.timestamp.toISOString(),
+      latest.details
+    );
+    db.prepare(
+      `INSERT OR REPLACE INTO audit_log
+       (id, slot, signature, market_id, type, actor, timestamp, details, integrity_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      latest.id,
+      latest.slot,
+      latest.signature,
+      latest.marketId,
+      latest.type,
+      latest.actor,
+      latest.timestamp.toISOString(),
+      latest.details,
+      latest.integrityHash
+    );
+  }
+
+  private persistFullStateToDatabase(): void {
+    if (this.persistenceBackend !== "sqlite") return;
+    const db = getDatabase();
+    const snapshot = this.buildSnapshot();
+    const disputeSnapshot = snapshot.disputeEngine ?? this.disputeEngine.snapshot();
+    const indexerSnapshot = snapshot.indexer ?? this.indexer.snapshot();
+
+    const insertMarket = db.prepare(
+      `INSERT OR REPLACE INTO markets
+       (id, creator, title, description, resolution_timestamp, category, status, total_participants, rules, resolution_source, outcome, revealed_yes_stake, revealed_no_stake, version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertPosition = db.prepare(
+      `INSERT OR REPLACE INTO positions
+       (id, market_id, wallet, commitment, encrypted_stake, encrypted_choice, submitted_at, claimed, version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertDispute = db.prepare(
+      `INSERT OR REPLACE INTO disputes
+       (id, market_id, submitted_by, contested_resolver, reason, status, created_at, updated_at, settlement_stake_at_risk_sol,
+        challenge_opened_at, challenge_deadline_at, challenge_closed_at,
+        resolution_outcome, resolution_resolved_by, resolution_note, resolution_resolved_at,
+        slash_bps, slash_amount_sol, slashed_resolver, slash_beneficiary, slash_reason, slash_applied_at,
+        invalid_reason_code, invalid_rationale, invalid_refund_mode, invalid_decided_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertEvidence = db.prepare(
+      `INSERT OR REPLACE INTO dispute_evidence
+       (id, dispute_id, submitted_by, summary, uri, source_type, source_domain, evidence_hash, verification_status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertEvent = db.prepare(
+      `INSERT OR REPLACE INTO indexer_events
+       (id, slot, signature, market_id, type, actor, timestamp, details)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    const insertAudit = db.prepare(
+      `INSERT OR REPLACE INTO audit_log
+       (id, slot, signature, market_id, type, actor, timestamp, details, integrity_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+
+    const tx = db.transaction(() => {
+      db.exec(
+        "DELETE FROM markets; DELETE FROM positions; DELETE FROM disputes; DELETE FROM dispute_evidence; DELETE FROM indexer_events; DELETE FROM audit_log; DELETE FROM probability_history;"
+      );
+
+      snapshot.markets.forEach((market) => this.persistMarketToDatabase(market));
+      snapshot.positions.forEach((position) => this.persistPositionToDatabase(position));
+
+      disputeSnapshot.disputes.forEach((dispute) => {
+        insertDispute.run(
+          dispute.id,
+          dispute.marketId,
+          dispute.submittedBy,
+          dispute.contestedResolver,
+          dispute.reason,
+          dispute.status,
+          dispute.createdAt,
+          dispute.updatedAt,
+          dispute.settlementStakeAtRiskSol,
+          dispute.challengeWindow.openedAt,
+          dispute.challengeWindow.deadlineAt,
+          dispute.challengeWindow.closedAt ?? null,
+          dispute.resolution?.outcome ?? null,
+          dispute.resolution?.resolvedBy ?? null,
+          dispute.resolution?.resolutionNote ?? null,
+          dispute.resolution?.resolvedAt ?? null,
+          dispute.slashing?.slashBps ?? null,
+          dispute.slashing?.slashAmountSol ?? null,
+          dispute.slashing?.slashedResolver ?? null,
+          dispute.slashing?.beneficiary ?? null,
+          dispute.slashing?.reason ?? null,
+          dispute.slashing?.appliedAt ?? null,
+          dispute.invalidResolution?.reasonCode ?? null,
+          dispute.invalidResolution?.rationale ?? null,
+          dispute.invalidResolution?.refundMode ?? null,
+          dispute.invalidResolution?.decidedAt ?? null
+        );
+        dispute.evidence.forEach((evidence) => {
+          insertEvidence.run(
+            evidence.id,
+            dispute.id,
+            evidence.submittedBy,
+            evidence.summary,
+            evidence.uri ?? null,
+            evidence.sourceType,
+            evidence.sourceDomain ?? null,
+            evidence.evidenceHash,
+            evidence.verificationStatus,
+            evidence.createdAt
+          );
+        });
+      });
+
+      indexerSnapshot.events.forEach((event) => {
+        insertEvent.run(
+          event.id,
+          event.slot,
+          event.signature,
+          event.marketId,
+          event.type,
+          event.actor,
+          event.timestamp,
+          event.details
+        );
+      });
+      indexerSnapshot.auditLog.forEach((entry) => {
+        insertAudit.run(
+          entry.id,
+          entry.slot,
+          entry.signature,
+          entry.marketId,
+          entry.type,
+          entry.actor,
+          entry.timestamp,
+          entry.details,
+          entry.integrityHash
+        );
+      });
+
+      writeMeta(db, {
+        schema_version: String(DB_SCHEMA_VERSION),
+        next_market_id: String(snapshot.nextMarketId),
+        next_position_id: String(snapshot.nextPositionId),
+        next_dispute_id: String(disputeSnapshot.nextDisputeId),
+        next_event_id: String(indexerSnapshot.nextEventId),
+        authority: snapshot.authority,
+      });
+    });
+
+    tx();
   }
 
   getRegistryAuthority(): string {
@@ -337,7 +825,13 @@ export class OracleStore {
       slot: 0,
       signature: randomBytes(32).toString("hex"),
     });
-    this.persistSnapshot();
+    if (this.persistenceBackend === "sqlite") {
+      this.persistMarketToDatabase(market);
+      this.persistLatestAuditEntry();
+      this.persistMeta();
+    } else {
+      this.persistSnapshot();
+    }
     return market;
   }
 
@@ -379,8 +873,14 @@ export class OracleStore {
       slot: 0, // Placeholder until indexer worker pushes real data
       signature: txSig
     });
-
-    this.persistSnapshot();
+    if (this.persistenceBackend === "sqlite") {
+      this.persistPositionToDatabase(position);
+      this.persistMarketToDatabase(market);
+      this.persistLatestAuditEntry();
+      this.persistMeta();
+    } else {
+      this.persistSnapshot();
+    }
     return { position, txSig };
   }
 
@@ -405,8 +905,27 @@ export class OracleStore {
     return this.indexer.listMarketActivity(marketId, limit);
   }
 
-  getMarketProbabilityHistory(_marketId: number, _limit = 96): Array<{ timestamp: Date; yesProbability: number; noProbability: number; volumeSol: number }> {
-    return [];
+  getMarketProbabilityHistory(marketId: number, limit = 96): Array<{ timestamp: Date; yesProbability: number; noProbability: number; volumeSol: number }> {
+    if (this.persistenceBackend !== "sqlite") return [];
+    const db = getDatabase();
+    const rows = db.prepare(
+      `SELECT timestamp, yes_probability, no_probability, volume_sol
+       FROM probability_history
+       WHERE market_id = ?
+       ORDER BY timestamp DESC
+       LIMIT ?`
+    ).all(marketId, Math.max(1, limit)) as Array<{
+      timestamp: string;
+      yes_probability: number;
+      no_probability: number;
+      volume_sol: number;
+    }>;
+    return rows.map((row) => ({
+      timestamp: new Date(row.timestamp),
+      yesProbability: row.yes_probability,
+      noProbability: row.no_probability,
+      volumeSol: row.volume_sol,
+    }));
   }
 
   listMarketDisputes(marketId: number): SettlementDisputeRecord[] {
@@ -419,19 +938,32 @@ export class OracleStore {
 
   openMarketDispute(input: OpenDisputeInput): SettlementDisputeRecord {
     const dispute = this.disputeEngine.openDispute(input);
-    this.persistSnapshot();
+    if (this.persistenceBackend === "sqlite") {
+      this.persistDisputeToDatabase(dispute);
+      this.persistMeta();
+    } else {
+      this.persistSnapshot();
+    }
     return dispute;
   }
 
   addDisputeEvidence(input: AddEvidenceInput): SettlementDisputeRecord {
     const dispute = this.disputeEngine.addEvidence(input);
-    this.persistSnapshot();
+    if (this.persistenceBackend === "sqlite") {
+      this.persistDisputeToDatabase(dispute);
+    } else {
+      this.persistSnapshot();
+    }
     return dispute;
   }
 
   resolveDispute(input: ResolveDisputeInput): SettlementDisputeRecord {
     const dispute = this.disputeEngine.resolveDispute(input);
-    this.persistSnapshot();
+    if (this.persistenceBackend === "sqlite") {
+      this.persistDisputeToDatabase(dispute);
+    } else {
+      this.persistSnapshot();
+    }
     return dispute;
   }
 
@@ -455,8 +987,13 @@ export class OracleStore {
       slot: input.slot ?? 0,
       signature: input.signature ?? "RELAY",
     });
-
-    this.persistSnapshot();
+    if (this.persistenceBackend === "sqlite") {
+      this.persistMarketToDatabase(market);
+      this.persistLatestAuditEntry();
+      this.persistMeta();
+    } else {
+      this.persistSnapshot();
+    }
     return market;
   }
 }
@@ -514,20 +1051,269 @@ function getDatabase(): Database {
       throw new Error("[oracle-store] SQLite backend unavailable. Install better-sqlite3 or switch ORACLE_STORE_BACKEND=file.");
     }
     database.pragma("journal_mode = wal");
-    database.exec(`
-      CREATE TABLE IF NOT EXISTS oracle_store (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        snapshot TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
+    ensureSchema(database);
+    migrateLegacySnapshotIfNeeded(database);
   }
   return database;
 }
 
-function loadSnapshotFromDatabase(): StoreSnapshot | null {
+function loadNormalizedStateFromDatabase(): StoreSnapshot | null {
+  const db = getDatabase();
+  const meta = readMeta(db);
+  const markets = loadMarketsFromDatabase(db);
+  const marketById = new Map(markets.map((market) => [market.id, market]));
+  const positions = loadPositionsFromDatabase(db, marketById);
+  const disputeSnapshot = loadDisputeSnapshotFromDatabase(db, meta);
+  const indexerSnapshot = loadIndexerSnapshotFromDatabase(db, meta);
+
+  const nextMarketId = resolveNextId(meta.next_market_id, markets.map((m) => m.id));
+  const nextPositionId = resolveNextId(meta.next_position_id, positions.map((p) => p.id));
+  const authority = meta.authority ?? resolveAdminAuthority();
+  const hasData =
+    markets.length > 0 ||
+    positions.length > 0 ||
+    disputeSnapshot.disputes.length > 0 ||
+    indexerSnapshot.events.length > 0 ||
+    Object.keys(meta).length > 0;
+
+  if (!hasData) return null;
+
+  return {
+    version: CURRENT_STORE_VERSION,
+    savedAt: new Date().toISOString(),
+    markets,
+    positions,
+    nextMarketId,
+    nextPositionId,
+    authority,
+    disputeEngine: disputeSnapshot,
+    indexer: indexerSnapshot,
+  };
+}
+
+function resolveNextId(metaValue: string | undefined, ids: number[]): number {
+  const parsed = Number.parseInt(metaValue ?? "", 10);
+  if (Number.isFinite(parsed)) return parsed;
+  const max = ids.length ? Math.max(...ids) : -1;
+  return max + 1;
+}
+
+function loadMarketsFromDatabase(db: Database): StoredMarket[] {
+  const rows = db
+    .prepare(
+      `SELECT id, creator, title, description, resolution_timestamp, category, status, total_participants, rules, resolution_source, outcome, revealed_yes_stake, revealed_no_stake, version
+       FROM markets ORDER BY id DESC`
+    )
+    .all() as Array<{
+    id: number;
+    creator: string;
+    title: string;
+    description: string;
+    resolution_timestamp: string;
+    category: string;
+    status: string;
+    total_participants: number;
+    rules: string;
+    resolution_source: string;
+    outcome: number | null;
+    revealed_yes_stake: number | null;
+    revealed_no_stake: number | null;
+    version: number;
+  }>;
+
+  return rows.map((row) => ({
+    id: row.id,
+    creator: row.creator,
+    title: row.title,
+    description: row.description,
+    resolutionTimestamp: row.resolution_timestamp,
+    category: row.category as MarketCategory,
+    status: row.status as MarketStatus,
+    totalParticipants: row.total_participants,
+    rules: safeJsonParse<string[]>(row.rules, []),
+    resolutionSource: row.resolution_source,
+    outcome: row.outcome === null ? undefined : Boolean(row.outcome),
+    revealedYesStake: row.revealed_yes_stake ?? undefined,
+    revealedNoStake: row.revealed_no_stake ?? undefined,
+    version: row.version,
+  }));
+}
+
+function loadPositionsFromDatabase(
+  db: Database,
+  markets: Map<number, StoredMarket>
+): StoredPosition[] {
+  const rows = db
+    .prepare(
+      `SELECT id, market_id, wallet, commitment, encrypted_stake, encrypted_choice, submitted_at, claimed, version
+       FROM positions ORDER BY submitted_at DESC`
+    )
+    .all() as Array<{
+    id: number;
+    market_id: number;
+    wallet: string;
+    commitment: string;
+    encrypted_stake: string | null;
+    encrypted_choice: string | null;
+    submitted_at: string;
+    claimed: number;
+    version: number;
+  }>;
+
+  return rows.map((row) => ({
+    id: row.id,
+    marketId: row.market_id,
+    marketTitle: markets.get(row.market_id)?.title ?? "Unknown Market",
+    wallet: row.wallet,
+    commitment: row.commitment,
+    encryptedStake: deserializeCipher(row.encrypted_stake),
+    encryptedChoice: deserializeCipher(row.encrypted_choice),
+    submittedAt: new Date(row.submitted_at),
+    claimed: Boolean(row.claimed),
+    version: row.version,
+  }));
+}
+
+function loadDisputeSnapshotFromDatabase(db: Database, meta: MetaRecord): DisputeEngineSnapshot {
+  const disputes = db
+    .prepare("SELECT * FROM disputes ORDER BY created_at DESC")
+    .all() as Array<Record<string, any>>;
+  const evidenceRows = db
+    .prepare("SELECT * FROM dispute_evidence ORDER BY created_at ASC")
+    .all() as Array<Record<string, any>>;
+  const evidenceMap = new Map<string, Array<Record<string, any>>>();
+  evidenceRows.forEach((row) => {
+    const list = evidenceMap.get(row.dispute_id) ?? [];
+    list.push(row);
+    evidenceMap.set(row.dispute_id, list);
+  });
+
+  const serialized = disputes.map((row) => ({
+    id: row.id,
+    marketId: row.market_id,
+    submittedBy: row.submitted_by,
+    contestedResolver: row.contested_resolver,
+    reason: row.reason,
+    status: row.status,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    settlementStakeAtRiskSol: row.settlement_stake_at_risk_sol,
+    challengeWindow: {
+      openedAt: row.challenge_opened_at,
+      deadlineAt: row.challenge_deadline_at,
+      closedAt: row.challenge_closed_at ?? undefined,
+    },
+    evidence: (evidenceMap.get(row.id) ?? []).map((evidence) => ({
+      id: evidence.id,
+      submittedBy: evidence.submitted_by,
+      summary: evidence.summary,
+      uri: evidence.uri ?? undefined,
+      sourceType: evidence.source_type,
+      sourceDomain: evidence.source_domain ?? undefined,
+      evidenceHash: evidence.evidence_hash,
+      verificationStatus: evidence.verification_status,
+      createdAt: evidence.created_at,
+    })),
+    resolution: row.resolution_outcome
+      ? {
+          outcome: row.resolution_outcome,
+          resolvedBy: row.resolution_resolved_by,
+          resolutionNote: row.resolution_note,
+          resolvedAt: row.resolution_resolved_at,
+        }
+      : undefined,
+    slashing: row.slash_bps
+      ? {
+          slashBps: row.slash_bps,
+          slashAmountSol: row.slash_amount_sol,
+          slashedResolver: row.slashed_resolver,
+          beneficiary: row.slash_beneficiary,
+          reason: row.slash_reason,
+          appliedAt: row.slash_applied_at,
+        }
+      : undefined,
+    invalidResolution: row.invalid_reason_code
+      ? {
+          reasonCode: row.invalid_reason_code,
+          rationale: row.invalid_rationale,
+          refundMode: row.invalid_refund_mode ?? "full_refund",
+          decidedAt: row.invalid_decided_at,
+        }
+      : undefined,
+  }));
+
+  const nextDisputeIdMeta = Number.parseInt(meta.next_dispute_id ?? "", 10);
+  const nextDisputeId = Number.isFinite(nextDisputeIdMeta)
+    ? nextDisputeIdMeta
+    : nextSequenceId(serialized.map((item) => item.id), "disp_");
+
+  return {
+    version: 1,
+    nextDisputeId,
+    disputes: serialized,
+  };
+}
+
+function loadIndexerSnapshotFromDatabase(db: Database, meta: MetaRecord): IndexerSnapshot {
+  const events = db
+    .prepare("SELECT * FROM indexer_events ORDER BY id DESC")
+    .all() as Array<Record<string, any>>;
+  const auditLog = db
+    .prepare("SELECT * FROM audit_log ORDER BY id DESC")
+    .all() as Array<Record<string, any>>;
+
+  const serializedEvents = events.map((row) => ({
+    id: row.id,
+    slot: row.slot,
+    signature: row.signature,
+    marketId: row.market_id,
+    type: row.type,
+    actor: row.actor,
+    timestamp: row.timestamp,
+    details: row.details,
+  }));
+
+  const serializedAudit = auditLog.map((row) => ({
+    id: row.id,
+    slot: row.slot,
+    signature: row.signature,
+    marketId: row.market_id,
+    type: row.type,
+    actor: row.actor,
+    timestamp: row.timestamp,
+    details: row.details,
+    integrityHash: row.integrity_hash,
+  }));
+
+  const nextEventIdMeta = Number.parseInt(meta.next_event_id ?? "", 10);
+  const nextEventId = Number.isFinite(nextEventIdMeta)
+    ? nextEventIdMeta
+    : nextSequenceId(serializedEvents.map((event) => event.id), "evt_");
+
+  return {
+    version: 2,
+    nextEventId,
+    events: serializedEvents,
+    auditLog: serializedAudit,
+  };
+}
+
+function migrateLegacySnapshotIfNeeded(db: Database): void {
+  const meta = readMeta(db);
+  if (meta.schema_version) return;
+
+  const legacyTable = db
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'oracle_store'")
+    .get() as { name?: string } | undefined;
+  if (!legacyTable?.name) return;
+
+  const legacySnapshot = loadLegacySnapshotFromDatabase(db);
+  if (!legacySnapshot) return;
+  importLegacySnapshot(db, legacySnapshot);
+}
+
+function loadLegacySnapshotFromDatabase(db: Database): StoreSnapshot | null {
   try {
-    const db = getDatabase();
     const row = db.prepare("SELECT snapshot FROM oracle_store WHERE id = 1").get() as { snapshot?: string } | undefined;
     if (!row?.snapshot) return null;
     const snapshot = JSON.parse(row.snapshot) as StoreSnapshot;
@@ -547,24 +1333,164 @@ function loadSnapshotFromDatabase(): StoreSnapshot | null {
       console.error("[oracle-store] FATAL: Store database is corrupt. Build aborted.");
       process.exit(1);
     }
-    console.error("[oracle-store] Failed to load snapshot from database.", err);
+    console.error("[oracle-store] Failed to load legacy snapshot from database.", err);
     return null;
   }
 }
 
-function saveSnapshotToDatabase(snapshot: StoreSnapshot): void {
-  try {
-    const db = getDatabase();
-    const dataToHash = JSON.stringify({ ...snapshot, checksum: undefined });
-    snapshot.checksum = createHash("sha256").update(dataToHash).digest("hex");
-    const payload = JSON.stringify(snapshot);
-    db.prepare("INSERT OR REPLACE INTO oracle_store (id, snapshot, updated_at) VALUES (1, ?, ?)").run(
-      payload,
-      new Date().toISOString()
-    );
-  } catch (error) {
-    console.error("[oracle-store] Failed to persist snapshot to database.", error);
-  }
+function importLegacySnapshot(db: Database, snapshot: StoreSnapshot): void {
+  const insertMarket = db.prepare(
+    `INSERT OR REPLACE INTO markets
+    (id, creator, title, description, resolution_timestamp, category, status, total_participants, rules, resolution_source, outcome, revealed_yes_stake, revealed_no_stake, version)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const insertPosition = db.prepare(
+    `INSERT OR REPLACE INTO positions
+     (id, market_id, wallet, commitment, encrypted_stake, encrypted_choice, submitted_at, claimed, version)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const insertDispute = db.prepare(
+    `INSERT OR REPLACE INTO disputes
+     (id, market_id, submitted_by, contested_resolver, reason, status, created_at, updated_at, settlement_stake_at_risk_sol,
+      challenge_opened_at, challenge_deadline_at, challenge_closed_at,
+      resolution_outcome, resolution_resolved_by, resolution_note, resolution_resolved_at,
+      slash_bps, slash_amount_sol, slashed_resolver, slash_beneficiary, slash_reason, slash_applied_at,
+      invalid_reason_code, invalid_rationale, invalid_refund_mode, invalid_decided_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const insertEvidence = db.prepare(
+    `INSERT OR REPLACE INTO dispute_evidence
+     (id, dispute_id, submitted_by, summary, uri, source_type, source_domain, evidence_hash, verification_status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const insertEvent = db.prepare(
+    `INSERT OR REPLACE INTO indexer_events
+     (id, slot, signature, market_id, type, actor, timestamp, details)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const insertAudit = db.prepare(
+    `INSERT OR REPLACE INTO audit_log
+     (id, slot, signature, market_id, type, actor, timestamp, details, integrity_hash)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+
+  const tx = db.transaction(() => {
+    snapshot.markets.forEach((market) => {
+      insertMarket.run(
+        market.id,
+        market.creator,
+        market.title,
+        market.description,
+        market.resolutionTimestamp,
+        market.category,
+        market.status,
+        market.totalParticipants,
+        JSON.stringify(market.rules ?? []),
+        market.resolutionSource,
+        typeof market.outcome === "boolean" ? Number(market.outcome) : null,
+        market.revealedYesStake ?? null,
+        market.revealedNoStake ?? null,
+        market.version
+      );
+    });
+    snapshot.positions.forEach((position) => {
+      insertPosition.run(
+        position.id,
+        position.marketId,
+        position.wallet,
+        position.commitment,
+        serializeCipher(position.encryptedStake),
+        serializeCipher(position.encryptedChoice),
+        position.submittedAt.toISOString(),
+        position.claimed ? 1 : 0,
+        position.version
+      );
+    });
+    if (snapshot.disputeEngine) {
+      snapshot.disputeEngine.disputes.forEach((dispute) => {
+        insertDispute.run(
+          dispute.id,
+          dispute.marketId,
+          dispute.submittedBy,
+          dispute.contestedResolver,
+          dispute.reason,
+          dispute.status,
+          dispute.createdAt,
+          dispute.updatedAt,
+          dispute.settlementStakeAtRiskSol,
+          dispute.challengeWindow.openedAt,
+          dispute.challengeWindow.deadlineAt,
+          dispute.challengeWindow.closedAt ?? null,
+          dispute.resolution?.outcome ?? null,
+          dispute.resolution?.resolvedBy ?? null,
+          dispute.resolution?.resolutionNote ?? null,
+          dispute.resolution?.resolvedAt ?? null,
+          dispute.slashing?.slashBps ?? null,
+          dispute.slashing?.slashAmountSol ?? null,
+          dispute.slashing?.slashedResolver ?? null,
+          dispute.slashing?.beneficiary ?? null,
+          dispute.slashing?.reason ?? null,
+          dispute.slashing?.appliedAt ?? null,
+          dispute.invalidResolution?.reasonCode ?? null,
+          dispute.invalidResolution?.rationale ?? null,
+          dispute.invalidResolution?.refundMode ?? null,
+          dispute.invalidResolution?.decidedAt ?? null
+        );
+        dispute.evidence.forEach((evidence) => {
+          insertEvidence.run(
+            evidence.id,
+            dispute.id,
+            evidence.submittedBy,
+            evidence.summary,
+            evidence.uri ?? null,
+            evidence.sourceType,
+            evidence.sourceDomain ?? null,
+            evidence.evidenceHash,
+            evidence.verificationStatus,
+            evidence.createdAt
+          );
+        });
+      });
+    }
+    if (snapshot.indexer) {
+      snapshot.indexer.events.forEach((event) => {
+        insertEvent.run(
+          event.id,
+          event.slot,
+          event.signature,
+          event.marketId,
+          event.type,
+          event.actor,
+          event.timestamp,
+          event.details
+        );
+      });
+      snapshot.indexer.auditLog.forEach((entry) => {
+        insertAudit.run(
+          entry.id,
+          entry.slot,
+          entry.signature,
+          entry.marketId,
+          entry.type,
+          entry.actor,
+          entry.timestamp,
+          entry.details,
+          entry.integrityHash
+        );
+      });
+    }
+
+    writeMeta(db, {
+      schema_version: String(DB_SCHEMA_VERSION),
+      next_market_id: String(snapshot.nextMarketId),
+      next_position_id: String(snapshot.nextPositionId),
+      next_dispute_id: String(snapshot.disputeEngine?.nextDisputeId ?? 1),
+      next_event_id: String(snapshot.indexer?.nextEventId ?? 1),
+      authority: snapshot.authority,
+    });
+  });
+
+  tx();
 }
 
 function loadSnapshot(path: string): StoreSnapshot | null {
@@ -606,10 +1532,7 @@ function queueSnapshotSave(backend: StoreBackend, path: string | undefined, snap
     pendingPath = undefined;
     persistTimer = null;
     if (!snapshotToSave || !backendToUse) return;
-    if (backendToUse === "sqlite") {
-      saveSnapshotToDatabase(snapshotToSave);
-      return;
-    }
+    if (backendToUse !== "file") return;
     if (pathToUse) {
       void saveSnapshot(pathToUse, snapshotToSave);
     }
