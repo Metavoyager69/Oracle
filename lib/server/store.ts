@@ -204,6 +204,9 @@ export class OracleStore {
   }
 
   private seedDemoData() {
+    if (isProdLike()) {
+      throw new Error("[oracle-store] Demo data seeding is disabled in production.");
+    }
     this.markets = DEMO_MARKETS.map(m => ({
       id: m.id,
       creator: "SYSTEM",
