@@ -25,9 +25,12 @@ function toBase64(value: ArrayBuffer | Uint8Array): string {
   return btoa(binary);
 }
 
-function fromBase64(value: string): Uint8Array {
+function fromBase64(value: string): Uint8Array<ArrayBuffer> {
   if (typeof Buffer !== "undefined") {
-    return new Uint8Array(Buffer.from(value, "base64"));
+    const source = Buffer.from(value, "base64");
+    const bytes = new Uint8Array(source.byteLength);
+    bytes.set(source);
+    return bytes;
   }
   const binary = atob(value);
   const out = new Uint8Array(binary.length);
