@@ -3,6 +3,9 @@ import { serializeStoredPosition } from "../../../utils/api";
 import { enforceRateLimit, rateLimitKey, requireJson, requireWalletAuth } from "../../../lib/server/api-guards";
 import { normalizeWallet, store } from "../../../lib/server/store";
 
+// Positions API accepts encrypted client payloads plus wallet auth. The demo
+// store currently records those payloads directly; a mainnet rollout should tie
+// this write path to a confirmed on-chain submit-position transaction.
 export const config = {
   api: {
     bodyParser: {
@@ -27,6 +30,8 @@ function parseCipher(value: unknown): CipherPayload | undefined {
   if (!value || typeof value !== "object") return undefined;
   const maybe = value as { c1?: unknown; c2?: unknown };
   if (!Array.isArray(maybe.c1) || !Array.isArray(maybe.c2)) return undefined;
+  // Shape validation here is intentionally lightweight. Real cryptographic
+  // validation belongs in the program/relayer boundary, not in a JSON parser.
   return { 
     c1: maybe.c1.filter((item): item is number => typeof item === "number").slice(0, 32),
     c2: maybe.c2.filter((item): item is number => typeof item === "number").slice(0, 32)
@@ -94,6 +99,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!(await requireWalletAuth(req, res, { wallet, action: "positions:submit", auth }))) return;
 
     try {
+      // Demo path: store records the submission immediately and returns a local
+      // signature placeholder. Mainnet should persist only after the matching
+      // program instruction is accepted and tracked by the backend/indexer.
       const result = store.submitPosition({
         marketId,
         wallet,

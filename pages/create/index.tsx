@@ -7,7 +7,9 @@ import Navbar from "../../components/Navbar";
 import { MARKET_CATEGORIES, type MarketCategory } from "../../utils/program";
 import { createWalletAuthPayload, ensureWalletUnlocked } from "../../utils/wallet-guard";
 
-// Create page aims to keep market rules explicit and auditable before launch.
+// This form gathers the off-chain metadata that both the backend store and the
+// future on-chain market account need. Mainnet should keep the UX here while
+// making chain confirmation, not local store writes, the final success signal.
 export default function CreateMarket() {
   const wallet = useWallet();
   const { connected, publicKey } = wallet;
@@ -55,6 +57,8 @@ export default function CreateMarket() {
           title,
           description,
           category,
+          // Normalize to an ISO timestamp before sending so the server persists
+          // one canonical settlement time regardless of browser locale.
           resolutionTimestamp: new Date(`${resolutionDate}T00:00:00.000Z`).toISOString(),
           resolutionSource,
           rules: parsedRules,
@@ -63,6 +67,9 @@ export default function CreateMarket() {
         }),
       });
 
+      // Today this API call creates the market in the app store. Mainnet work
+      // is to pair it with the real program instruction and wait for that
+      // transaction to confirm before showing success.
       const payload = await response.json();
       if (!response.ok) {
         throw new Error(payload?.error ?? "Could not create market.");

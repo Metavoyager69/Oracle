@@ -3,6 +3,9 @@ import { buildRevealMessage } from "../../../utils/arcium";
 import { enforceRateLimit, rateLimitKey, requireJson } from "../../../lib/server/api-guards";
 import { store } from "../../../lib/server/store";
 
+// Relay endpoint records the aggregated MPC reveal for one market. Mainnet
+// must authenticate the relayer and/or verify its proof before updating stored
+// totals because this route changes settlement-visible market state.
 function parseU64(value: unknown): bigint | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     if (value < 0) return null;
@@ -70,6 +73,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
+    // The reveal message is the deterministic payload both sides can hash/sign
+    // so the backend and on-chain relay logic agree on what was revealed.
     const message = await buildRevealMessage(marketId, yesTotal, noTotal);
     const market = store.recordRelayReveal({
       marketId,

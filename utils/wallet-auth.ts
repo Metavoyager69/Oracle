@@ -1,3 +1,5 @@
+// Client and server both rely on this exact message shape. Treat it like an
+// auth protocol contract: if it changes, update both sides together.
 export const WALLET_AUTH_TTL_MS = 2 * 60 * 1000;
 
 export function buildWalletAuthMessage(

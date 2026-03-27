@@ -1,5 +1,9 @@
 import type { WalletContextState } from "@solana/wallet-adapter-react";
 
+// The nonce vault keeps the stake blinding nonce only in the browser, encrypted
+// with a key derived from the wallet's signature. Mainnet ops should document
+// backup/recovery expectations because this value is intentionally not stored
+// on the backend.
 const encoder = new TextEncoder();
 const VAULT_MESSAGE = "Oracle nonce vault v1";
 
@@ -71,6 +75,8 @@ async function deriveVaultKey(wallet: WalletSigner): Promise<CryptoKey> {
   const cached = keyCache.get(walletKey);
   if (cached) return cached;
 
+  // The signing wallet derives the local encryption key, which means the vault
+  // contents are tied to that wallet/session and are not globally recoverable.
   const signature = toCryptoBytes(await wallet.signMessage(encoder.encode(VAULT_MESSAGE)));
   const keyMaterial = await globalThis.crypto.subtle.importKey(
     "raw",

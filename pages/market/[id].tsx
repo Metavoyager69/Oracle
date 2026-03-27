@@ -14,6 +14,10 @@ import {
 } from "../../utils/arcium";
 import { storeStakeNonce } from "../../utils/nonce-vault";
 
+// This page already shows the intended private-position UX, but it still uses
+// demo market data and a mocked submission. Mainnet work here is to load the
+// market from the backend, send the real Anchor instruction, and refresh from
+// confirmed state instead of inventing a transaction signature locally.
 type StepState = "idle" | "encrypting" | "submitting" | "confirmed" | "error";
 
 export default function MarketPage() {
@@ -26,6 +30,8 @@ export default function MarketPage() {
     ? new AnchorProvider(connection, anchorWallet, { preflightCommitment: "confirmed" })
     : null;
 
+  // Demo shortcut: detail view still reads bundled data. Swap this to the
+  // `/api/markets/[id]` contract before shipping mainnet traffic.
   const market = DEMO_MARKETS.find((m) => m.id === Number(id));
 
   const [choice, setChoice] = useState<"yes" | "no" | null>(null);
@@ -92,6 +98,9 @@ export default function MarketPage() {
       //         ).accounts({...}).rpc()
       await new Promise((r) => setTimeout(r, 1800));
 
+      // Demo-only confirmation. Mainnet must use the signature returned by the
+      // wallet/program flow so explorers, retries, and backend projections all
+      // point at the same transaction.
       const fakeSig =
         Array.from(crypto.getRandomValues(new Uint8Array(32)))
           .map((b) => b.toString(16).padStart(2, "0"))

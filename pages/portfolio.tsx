@@ -13,6 +13,9 @@ import {
 import { deserializePosition, type ApiPosition } from "../utils/api";
 import { createWalletAuthPayload } from "../utils/wallet-guard";
 
+// Portfolio is intentionally wallet-scoped and backend-driven. That is the
+// correct shape for mainnet because encrypted positions should never leak
+// through public market discovery endpoints.
 function formatSigned(value: number): string {
   const rounded = Math.abs(value).toFixed(2);
   return `${value >= 0 ? "+" : "-"}${rounded} SOL`;
@@ -41,6 +44,8 @@ export default function PortfolioPage() {
       setLoadError(null);
 
       try {
+        // Frontend signs an action-specific auth payload so the backend can
+        // safely return private history for one wallet only.
         const auth = await createWalletAuthPayload({ connected, publicKey, signMessage }, "portfolio:view");
         const authParam = encodeURIComponent(JSON.stringify(auth));
         const response = await fetch(

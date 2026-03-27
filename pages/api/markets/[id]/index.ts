@@ -4,6 +4,8 @@ import { normalizeWallet, store } from "../../../../lib/server/store";
 
 // API endpoint: returns one market plus related chart/activity/dispute data.
 // Important privacy rule: position history is wallet-scoped only.
+// Mainnet note: if wallet-scoped history remains sensitive, this route should
+// require the same signed wallet auth used by /api/portfolio before returning it.
 function parseId(value: string | string[] | undefined): number {
   const raw = Array.isArray(value) ? value[0] : value;
   if (!raw) return Number.NaN;

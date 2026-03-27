@@ -11,6 +11,9 @@ import {
 } from "../../utils/program";
 import { deserializeMarket, type ApiMarket } from "../../utils/api";
 
+// Discovery is midway through the demo-to-mainnet transition. It boots from
+// bundled sample data, then replaces that with backend data when the API is up.
+// On mainnet, the API should be authoritative and fallbacks should be explicit.
 type StatusFilter = "all" | "open" | "settled";
 type CategoryFilter = "all" | MarketCategory;
 
@@ -29,6 +32,8 @@ export default function MarketsPage() {
       setLoadError(null);
 
       try {
+        // Pages consume serialized API data and convert it back into Date-rich
+        // UI models locally. Keep that boundary when hardening for mainnet.
         const response = await fetch("/api/markets");
         const contentType = response.headers.get("content-type"); if (!contentType || !contentType.includes("application/json")) { const text = await response.text(); throw new Error(`Expected JSON but got ${contentType || "unknown"}. Status: ${response.status}. Preview: ${text.slice(0, 100)}`); } const payload = await response.json();
 
@@ -46,6 +51,8 @@ export default function MarketsPage() {
         if (!cancelled) {
           const message = caught instanceof Error ? caught.message : "Unknown API error.";
           setLoadError(message);
+          // Demo fallback is convenient during development, but production
+          // should make backend outages obvious instead of hiding them.
           setMarkets(DEMO_MARKETS);
         }
       } finally {

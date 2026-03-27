@@ -5,7 +5,9 @@ import { WALLET_AUTH_TTL_MS, buildWalletAuthMessage, isWalletAuthFresh } from ".
 import { store } from "./store";
 import { getRedisClient } from "./redis";
 
-// [OBSERVABILITY UPGRADE] - Structured Logging helper
+// Shared API perimeter checks live here: rate limiting, wallet-auth verification,
+// admin access, and nonce replay protection. In local development a few pieces
+// can fall back to memory, but mainnet should rely on Redis-backed storage.
 function log(level: string, message: string, data: any = {}) {
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
@@ -35,6 +37,8 @@ type WalletAuthPayload = {
 
 const buckets = new Map<string, RateLimitState>();
 const MAX_BUCKETS = 10_000;
+// Nonce cache is only a development fallback; production should store replay
+// protection in Redis so it survives serverless/process churn.
 const nonceCache = new Map<string, number>();
 const MAX_NONCE_CACHE = 25_000;
 
@@ -109,6 +113,8 @@ export async function enforceRateLimit(
       res.status(503).json({ error: "Rate limiter unavailable. Configure Upstash Redis." });
       return false;
     }
+    // Memory fallback keeps local demos usable, but it is not safe enough for
+    // horizontally scaled production traffic.
     return enforceRateLimitMemory(req, res, options);
   }
 
@@ -251,6 +257,8 @@ export async function requireWalletAuth(
     return false;
   }
 
+  // The signed message binds the request to a specific action, wallet, time,
+  // and nonce so intercepted signatures cannot be replayed on different routes.
   const signatureBytes = decodeBase64(auth.signature);
   if (!signatureBytes) {
     res.status(401).json({ error: "Invalid wallet signature encoding." });

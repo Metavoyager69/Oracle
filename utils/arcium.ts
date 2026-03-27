@@ -5,6 +5,8 @@
  * Uses the official Arcium TypeScript client SDK to encrypt stakes and choices.
  * The encrypted payloads can be submitted to Arcium-enabled programs without
  * leaking plaintext to the network.
+ * Mainnet note: these helpers prepare ciphertexts locally, but the final trust
+ * boundary is still the on-chain program plus the Arcium relay/reveal flow.
  */
 
 import type { AnchorProvider } from "@coral-xyz/anchor";
@@ -52,6 +54,8 @@ async function getMxePublicKeyWithRetry(
   retries = 12,
   delayMs = 500
 ): Promise<Uint8Array> {
+  // Fresh local validators and newly deployed programs can take a moment
+  // before exposing the MXE key; retrying avoids flaky first-run failures.
   for (let attempt = 0; attempt < retries; attempt += 1) {
     const mxePublicKey = await getMXEPublicKey(provider, programId);
     if (mxePublicKey) return mxePublicKey;
@@ -64,6 +68,8 @@ async function createArciumCipher(
   provider: AnchorProvider,
   programId: PublicKey
 ): Promise<ArciumCipher> {
+  // Each submission uses an ephemeral client keypair. The frontend never keeps
+  // a long-lived decryption secret for market positions.
   const clientSecretKey = x25519.utils.randomSecretKey();
   const clientPublicKey = x25519.getPublicKey(clientSecretKey);
   const mxePublicKey = await getMxePublicKeyWithRetry(provider, programId);

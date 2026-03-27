@@ -4,7 +4,9 @@ import { serializeStoredMarket } from "../../../utils/api";
 import { enforceRateLimit, rateLimitKey, requireJson, requireWalletAuth } from "../../../lib/server/api-guards";
 import { normalizeWallet, store } from "../../../lib/server/store";
 
-// [BIG PICTURE ALIGNMENT] - Synced with lib.rs
+// Markets API is the backend boundary for discovery and creation. Right now it
+// writes to the local application store; on mainnet, the store should mirror
+// confirmed program state rather than being the only source of truth.
 const STATUS_SET = new Set<MarketStatus>(["Open", "SettledPending", "Challenged", "Settled", "Invalid", "Cancelled"]);
 
 export const config = {
@@ -67,6 +69,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!(await requireWalletAuth(req, res, { wallet: creatorWallet, action: "markets:create", auth }))) return;
 
     try {
+      // Mainnet note: this is where a confirmed on-chain market creation should
+      // be recorded or verified before persisting any market metadata locally.
       const market = store.createMarket({
         title,
         description,

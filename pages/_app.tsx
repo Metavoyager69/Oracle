@@ -13,6 +13,9 @@ import { clusterApiUrl } from "@solana/web3.js";
 import "@solana/wallet-adapter-react-ui/styles.css";
 import "../styles/globals.css";
 
+// App-level Solana wiring lives here. For mainnet, keep the selected cluster,
+// RPC URL, and deployed program id in sync through env/config rather than
+// leaving the UI on a hard-coded Devnet default.
 export default function App({ Component, pageProps }: AppProps) {
   const network = WalletAdapterNetwork.Devnet;
   const endpoint = useMemo(

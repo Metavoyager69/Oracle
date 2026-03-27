@@ -5,6 +5,9 @@ import Navbar from "../components/Navbar";
 import MarketCard from "../components/MarketCard";
 import { DEMO_MARKETS } from "../utils/program";
 
+// The landing page is intentionally marketing-first and uses bundled demo
+// markets. Mainnet trading should flow through /markets and /market/[id],
+// where backend data can be fetched without blocking this page's first paint.
 const TICKER_ITEMS = [
   "STAKES ENCRYPTED · ARCIUM MPC",
   "VOTES HIDDEN UNTIL SETTLEMENT",
@@ -16,6 +19,8 @@ const TICKER_ITEMS = [
 export default function Home() {
   const [filter, setFilter] = useState<"all" | "open" | "settled">("all");
 
+  // Homepage cards stay read-only sample data so the hero section is stable
+  // even when wallets, RPC, or backend APIs are unavailable.
   const filtered = DEMO_MARKETS.filter((m) => {
     if (filter === "open") return m.status === "Open";
     if (filter === "settled") return m.status === "Settled";

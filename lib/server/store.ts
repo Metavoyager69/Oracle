@@ -401,6 +401,8 @@ export class OracleStore {
     if (isProdLike()) {
       throw new Error("[oracle-store] Demo data seeding is disabled in production.");
     }
+    // Development-only bootstrap. Mainnet should arrive here with either
+    // persisted state or an indexer/import path, never with bundled demo markets.
     this.markets = DEMO_MARKETS.map(m => ({
       id: m.id,
       creator: "SYSTEM",
@@ -873,6 +875,8 @@ export class OracleStore {
     rules: string[];
     creatorWallet: string;
   }): StoredMarket {
+    // Today the backend generates the market id/status locally. In a mainnet
+    // setup those values should be mirrored from the program account or indexer.
     const market: StoredMarket = {
       id: this.nextMarketId++,
       creator: input.creatorWallet,
@@ -914,6 +918,8 @@ export class OracleStore {
   }
 
   submitPosition(input: SubmitPositionInput): { position: StoredPosition; txSig: string } {
+    // Demo shortcut: txSig is generated locally because there is no live
+    // program submission in this codepath yet.
     const txSig = randomBytes(32).toString("hex");
     const market = this.getMarketById(input.marketId);
     if (!market) {
@@ -1043,6 +1049,9 @@ export class OracleStore {
       throw new Error("Market not found.");
     }
 
+    // This write is where reveal totals become visible in the app. Mainnet
+    // should only reach it with a verified relayer signature/proof and a real
+    // slot/signature from the settlement transaction.
     market.revealedYesStake = input.yesTotal;
     market.revealedNoStake = input.noTotal;
     if (market.status === "Open") {

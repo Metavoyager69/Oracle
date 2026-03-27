@@ -3,8 +3,9 @@ import { serializeStoredPosition } from "../../../utils/api";
 import { normalizeWallet, store } from "../../../lib/server/store";
 import { requireWalletAuth } from "../../../lib/server/api-guards";
 
-// Portfolio API: returns wallet-scoped positions and summary metrics.
-// This endpoint intentionally requires a valid wallet parameter and authentication.
+// Portfolio API is the safe pattern to copy for private reads on mainnet: it
+// requires a wallet, verifies a signed auth payload, then returns only that
+// wallet's redacted position history and summary metrics.
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     res.setHeader("Allow", ["GET"]);

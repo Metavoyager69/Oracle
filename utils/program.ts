@@ -1,5 +1,8 @@
 import { PublicKey } from "@solana/web3.js";
 
+// Shared chain/program constants for the frontend. This file also carries demo
+// fixtures, so juniors should treat it as "UI helpers plus sample data", not as
+// the authoritative source of live market state.
 const DEFAULT_PROGRAM_ID = "7krCLEf4n4QnLnaLgJQTkQB7bS72PRxbM2dGZLb3oQto";
 
 function parsePublicKey(value: string | undefined, fallback: string): PublicKey {
@@ -14,6 +17,8 @@ export const PROGRAM_ID = parsePublicKey(
   process.env.NEXT_PUBLIC_PREDICTION_MARKET_PROGRAM_ID,
   DEFAULT_PROGRAM_ID
 );
+// Mainnet rollout: set NEXT_PUBLIC_PREDICTION_MARKET_PROGRAM_ID and
+// NEXT_PUBLIC_SOLANA_RPC together so the UI talks to the correct cluster.
 
 export const MARKET_SEED = Buffer.from("market");
 export const VAULT_SEED = Buffer.from("vault");
@@ -168,6 +173,8 @@ export function getPortfolioSummary(positions: DemoPosition[]) {
 }
 
 export const DEMO_MARKETS: DemoMarket[] = [
+  // Demo fixtures keep the UI explorable before backend/on-chain data is wired.
+  // They should become fallback data only once mainnet-backed APIs are live.
   {
     id: 0,
     category: "Crypto",
