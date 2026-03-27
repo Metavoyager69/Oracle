@@ -1,8 +1,8 @@
 import { createHash, randomBytes } from "crypto";
 
-// This service is the "rulebook engine" for settlement disputes.
-// It keeps an in-memory record of disputes, enforces challenge deadlines,
-// and records whether a resolver should be slashed when a challenge succeeds.
+// This service is the "rulebook engine" for settlement disputes. The store
+// serializes its snapshot into sqlite/file persistence, so the in-memory
+// model here doubles as the source of truth for dispute rows.
 const DEFAULT_CHALLENGE_WINDOW_HOURS = 24;
 const DEFAULT_SLASH_BPS = 500;
 const MIN_SLASH_BPS = 50;
@@ -376,6 +376,8 @@ export class SettlementDisputeEngine {
   }
 
   snapshot(): DisputeEngineSnapshot {
+    // Store snapshots persist disputes as JSON-safe strings, so Date fields
+    // are converted here before the outer store writes them.
     return {
       version: 1,
       nextDisputeId: this.nextDisputeId,
@@ -387,6 +389,8 @@ export class SettlementDisputeEngine {
     if (!snapshot || snapshot.version !== 1) {
       throw new Error("Unsupported dispute engine snapshot version.");
     }
+    // Restoring here keeps the store layer free to treat disputes as a single
+    // opaque subsystem when rehydrating application state.
     this.nextDisputeId = snapshot.nextDisputeId;
     this.disputes = snapshot.disputes.map(deserializeDisputeSnapshot);
   }

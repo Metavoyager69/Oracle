@@ -27,13 +27,15 @@ import {
 } from "./services/dispute-engine";
 import { assertRuntimeConfig, isProdLike } from "./runtime-env";
 
-// [ISSUE 5 FIX] - Incremented version for new schema
+// OracleStore owns all persisted market state. It can rehydrate from a
+// normalized sqlite schema or from a JSON snapshot file for local fallback.
 const CURRENT_STORE_VERSION = 3; 
 
 const STORE_PATH_ENV = "ORACLE_STORE_PATH";
 const STORE_BACKEND_ENV = "ORACLE_STORE_BACKEND";
 const DB_PATH_ENV = "ORACLE_DB_PATH";
-// [ISSUE 9 FIX] - Use absolute path from project root to ensure consistency across dev/prod
+// Resolve persistence paths from the project root so local and deployed
+// environments agree on where fallback files/dbs live.
 const PROJECT_ROOT = process.cwd();
 const DEFAULT_STORE_PATH = resolve(PROJECT_ROOT, "data", "oracle-store.json");
 const DEFAULT_DB_PATH = resolve(PROJECT_ROOT, "data", "oracle-store.db");
@@ -53,6 +55,7 @@ let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let missingPersistenceWarned = false;
 type SqliteDatabase = InstanceType<typeof Database>;
 
+// One sqlite handle is shared for the life of the process.
 let database: SqliteDatabase | null = null;
 
 type MetaRecord = Record<string, string>;
@@ -86,6 +89,8 @@ function deserializeCipher(
 }
 
 function ensureSchema(db: SqliteDatabase): void {
+  // The normalized schema keeps queryable entities in first-class tables while
+  // smaller counters and version markers stay in oracle_meta.
   db.exec(`
     CREATE TABLE IF NOT EXISTS oracle_meta (
       key TEXT PRIMARY KEY,
@@ -306,6 +311,8 @@ export interface RelayRevealInput {
 }
 
 function resolveAdminAuthority(): string {
+  // Production should supply a stable admin identity. In local development we
+  // fall back to a generated keypair so the app remains bootable.
   const inProd = isProdLike();
   const explicit = process.env[ADMIN_WALLET_ENV]?.trim();
   if (explicit) {
@@ -367,6 +374,8 @@ export class OracleStore {
     this.persistenceBackend = resolveStoreBackend();
     assertProductionPersistence(this.persistenceBackend);
     this.persistencePath = resolvePersistencePath(this.persistenceBackend);
+    // Prefer normalized sqlite rehydration when available; the file backend
+    // keeps a full JSON snapshot instead.
     const snapshot =
       this.persistenceBackend === "sqlite"
         ? loadNormalizedStateFromDatabase()
@@ -430,6 +439,8 @@ export class OracleStore {
   }
 
   private applySnapshot(snapshot: StoreSnapshot) {
+    // Restore JSON-safe snapshot data back into runtime-friendly shapes such
+    // as Date instances and subsystem state machines.
     this.markets = snapshot.markets;
     this.positions = snapshot.positions.map(p => ({
       ...p,
@@ -462,6 +473,8 @@ export class OracleStore {
 
   private persistSnapshot() {
     if (this.persistenceBackend === "sqlite") {
+      // Sqlite writes entity rows eagerly, so the snapshot path only needs to
+      // keep meta counters in sync.
       this.persistMeta();
       return;
     }
@@ -480,6 +493,8 @@ export class OracleStore {
     const db = getDatabase();
     const disputeSnapshot = this.disputeEngine.snapshot();
     const indexerSnapshot = this.indexer.snapshot();
+    // These counters let rehydration continue id generation without scanning
+    // every table on boot.
     writeMeta(db, {
       schema_version: String(DB_SCHEMA_VERSION),
       next_market_id: String(this.nextMarketId),
@@ -703,6 +718,8 @@ export class OracleStore {
     );
 
     const tx = db.transaction(() => {
+      // Full rewrites are reserved for initialization and migration paths.
+      // Hot-path updates use the narrower persist* helpers above.
       db.exec(
         "DELETE FROM markets; DELETE FROM positions; DELETE FROM disputes; DELETE FROM dispute_evidence; DELETE FROM indexer_events; DELETE FROM audit_log; DELETE FROM probability_history;"
       );
@@ -1107,12 +1124,16 @@ function getDatabase(): SqliteDatabase {
     database.pragma("journal_mode = wal");
     database.pragma("foreign_keys = ON");
     ensureSchema(database);
+    // Older installs stored everything in a single snapshot row; migrate them
+    // forward once after opening the normalized schema.
     migrateLegacySnapshotIfNeeded(database);
   }
   return database;
 }
 
 function loadNormalizedStateFromDatabase(): StoreSnapshot | null {
+  // Reconstruct the in-memory snapshot shape expected by OracleStore from the
+  // normalized tables plus meta counters.
   const db = getDatabase();
   const meta = readMeta(db);
   const markets = loadMarketsFromDatabase(db);
@@ -1357,6 +1378,8 @@ function migrateLegacySnapshotIfNeeded(db: SqliteDatabase): void {
   const meta = readMeta(db);
   if (meta.schema_version) return;
 
+  // Legacy sqlite installs used a single oracle_store row that mirrored the
+  // file backend snapshot shape.
   const legacyTable = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'oracle_store'")
     .get() as { name?: string } | undefined;
@@ -1579,6 +1602,7 @@ function queueSnapshotSave(backend: StoreBackend, path: string | undefined, snap
   pendingBackend = backend;
   pendingPath = path;
   if (persistTimer) return;
+  // Debounce file snapshots so bursts of writes coalesce into one disk flush.
   persistTimer = setTimeout(() => {
     const snapshotToSave = pendingSnapshot;
     const backendToUse = pendingBackend;
@@ -1604,6 +1628,8 @@ async function saveSnapshot(path: string, snapshot: StoreSnapshot): Promise<void
     const dataToHash = JSON.stringify({ ...snapshot, checksum: undefined });
     snapshot.checksum = createHash("sha256").update(dataToHash).digest("hex");
 
+    // Write-then-rename keeps partially written files from becoming the next
+    // startup snapshot after crashes or interrupted saves.
     await fs.writeFile(tempPath, JSON.stringify(snapshot, null, 2), "utf8");
     await fs.rename(tempPath, resolved);
   } catch (error) {

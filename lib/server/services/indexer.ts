@@ -1,6 +1,8 @@
 import { createHash, randomBytes } from "crypto";
 import type { MarketStatus } from "../../../utils/program";
 
+// The store persists this service alongside markets so operators can inspect
+// an append-only activity feed and its tamper-evident audit trail.
 export type IndexerEventType =
   | "MARKET_CREATED"
   | "POSITION_COMMITTED"
@@ -68,6 +70,8 @@ interface SerializedAuditLogRecord extends SerializedIndexerEvent {
 
 export class SolanaIndexerWorkerService {
   private events: IndexerEventRecord[] = [];
+  // Newest audit entry stays at index 0 so each new hash can chain off the
+  // previously committed head in O(1).
   private auditLog: AuditLogRecord[] = [];
   private nextEventId = 1;
 
@@ -105,6 +109,8 @@ export class SolanaIndexerWorkerService {
     };
 
     this.events.unshift(event);
+    // Each audit record hashes the previous head plus the current event
+    // payload, creating a simple integrity chain over persisted activity.
     const previousHash = this.auditLog[0]?.integrityHash ?? "GENESIS";
     const integrityHash = createHash("sha256")
       .update(previousHash)
@@ -157,6 +163,7 @@ export class SolanaIndexerWorkerService {
     this.events = snapshot.events.map(deserializeEventSnapshot);
     this.auditLog = snapshot.auditLog.map(deserializeAuditSnapshot);
     
+    // Re-verify persisted history before trusting the reconstructed audit log.
     if (!this.verifyIntegrityChain()) {
       console.error("[indexer] Snapshot integrity verification FAILED.");
     }

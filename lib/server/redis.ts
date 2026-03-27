@@ -1,3 +1,5 @@
+// Tiny REST-backed Redis client used by the server runtime. Keeping this
+// local avoids taking a hard dependency on the full Upstash SDK in builds.
 type RedisSetOptions = {
   nx?: boolean;
   px?: number;
@@ -10,6 +12,8 @@ export interface RedisClient {
   set(key: string, value: string, options?: RedisSetOptions): Promise<string | null>;
 }
 
+// Reuse one client per process so route handlers do not rebuild config on
+// every request.
 let client: RedisClient | null = null;
 
 class UpstashRedisRestClient implements RedisClient {
@@ -45,6 +49,8 @@ class UpstashRedisRestClient implements RedisClient {
   }
 
   private async command<T>(args: Array<string | number>): Promise<T> {
+    // Upstash's REST API maps Redis commands onto path segments, so each
+    // argument is encoded independently before the POST.
     const path = args.map((arg) => encodeURIComponent(String(arg))).join("/");
     const response = await fetch(`${this.baseUrl}/${path}`, {
       method: "POST",
@@ -77,6 +83,8 @@ export function isRedisConfigured(): boolean {
 export function getRedisClient(): RedisClient | null {
   if (!isRedisConfigured()) return null;
   if (!client) {
+    // Lazy init keeps local development/test runs free of Redis requirements
+    // until a caller actually needs rate-limiting storage.
     client = new UpstashRedisRestClient(
       process.env.UPSTASH_REDIS_REST_URL as string,
       process.env.UPSTASH_REDIS_REST_TOKEN as string

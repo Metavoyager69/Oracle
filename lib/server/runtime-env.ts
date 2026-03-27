@@ -1,5 +1,8 @@
+// Centralized production-only validation for persistence and rate-limiting
+// config. Store boot calls this once so bad deploys fail fast.
 const PROD_NODE_ENVS = new Set(["production", "prod"]);
 
+// Module-level latch so repeated imports do not re-validate env state.
 let validated = false;
 
 export function isProdLike(): boolean {
@@ -21,6 +24,8 @@ export function assertRuntimeConfig(): void {
   validated = true;
   if (!isProdLike()) return;
 
+  // Production must choose a persistence backend explicitly so cold starts
+  // do not silently drift between sqlite and file snapshots.
   const backendRaw = requireEnv(
     "ORACLE_STORE_BACKEND",
     "[oracle-env] ORACLE_STORE_BACKEND must be set to 'sqlite' or 'file' in production."
@@ -42,6 +47,8 @@ export function assertRuntimeConfig(): void {
     );
   }
 
+  // The admin authority has to be reproducible across restarts because the
+  // store serializes it alongside market and dispute state.
   const adminWallet = process.env.ORACLE_ADMIN_WALLET?.trim();
   const adminKeypairPath = process.env.ORACLE_ADMIN_KEYPAIR_PATH?.trim();
   if (!adminWallet && !adminKeypairPath) {
@@ -59,4 +66,3 @@ export function assertRuntimeConfig(): void {
     "[oracle-env] UPSTASH_REDIS_REST_TOKEN must be set in production for rate limiting."
   );
 }
-
