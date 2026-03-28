@@ -29,6 +29,12 @@ function parseStatus(raw: string | string[] | undefined): MarketStatus | undefin
   return STATUS_SET.has(value as MarketStatus) ? (value as MarketStatus) : undefined;
 }
 
+function parseOptionalMarketId(value: unknown): number | undefined {
+  if (typeof value !== "number" && typeof value !== "string") return undefined;
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method === "GET") {
     const status = parseStatus(req.query.status);
@@ -46,7 +52,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!requireJson(req, res)) return;
     if (!(await enforceRateLimit(req, res, { key: rateLimitKey(req, "markets:create"), limit: 6, windowMs: 60_000 }))) return;
 
-    const { title, description, resolutionSource, category, rules, creatorWallet: creatorWalletRaw, auth } = req.body;
+    const {
+      title,
+      description,
+      resolutionSource,
+      category,
+      rules,
+      creatorWallet: creatorWalletRaw,
+      auth,
+      marketId: requestedMarketId,
+      txSig,
+    } = req.body;
     let creatorWallet: string | undefined;
     try {
       creatorWallet = normalizeWallet(creatorWalletRaw);
@@ -69,8 +85,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!(await requireWalletAuth(req, res, { wallet: creatorWallet, action: "markets:create", auth }))) return;
 
     try {
-      // Mainnet note: this is where a confirmed on-chain market creation should
-      // be recorded or verified before persisting any market metadata locally.
+      const marketId = parseOptionalMarketId(requestedMarketId);
+      // Chain-backed create flow submits the real transaction in the browser,
+      // then mirrors the confirmed id/signature here so discovery pages can use
+      // the backend without drifting from program state.
       const market = store.createMarket({
         title,
         description,
@@ -79,6 +97,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         resolutionSource,
         rules,
         creatorWallet,
+        marketId,
+        txSig: typeof txSig === "string" ? txSig : undefined,
       });
       res.status(201).json({ market: serializeStoredMarket(market) });
     } catch (err) {

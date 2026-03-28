@@ -5,7 +5,6 @@ import { dirname, resolve } from "path";
 import Database from "better-sqlite3";
 import { Keypair } from "@solana/web3.js";
 import {
-  DEMO_MARKETS,
   getPortfolioSummary,
   type MarketCategory,
   type MarketStatus,
@@ -298,6 +297,7 @@ export interface SubmitPositionInput {
   commitment: string;
   encryptedStake?: { c1: number[]; c2: number[] };
   encryptedChoice?: { c1: number[]; c2: number[] };
+  txSig?: string;
 }
 
 export interface RelayRevealInput {
@@ -389,7 +389,7 @@ export class OracleStore {
       }
       this.applySnapshot(snapshot);
     } else {
-      this.seedDemoData();
+      this.initializeEmptyState();
     }
 
     if (this.persistenceBackend === "sqlite") {
@@ -397,47 +397,13 @@ export class OracleStore {
     }
   }
 
-  private seedDemoData() {
-    if (isProdLike()) {
-      throw new Error("[oracle-store] Demo data seeding is disabled in production.");
-    }
-    // Development-only bootstrap. Mainnet should arrive here with either
-    // persisted state or an indexer/import path, never with bundled demo markets.
-    this.markets = DEMO_MARKETS.map(m => ({
-      id: m.id,
-      creator: "SYSTEM",
-      title: m.title,
-      description: m.description,
-      resolutionTimestamp: m.resolutionTimestamp.toISOString(),
-      category: m.category,
-      status: m.status,
-      totalParticipants: m.totalParticipants,
-      rules: m.rules,
-      resolutionSource: m.resolutionSource,
-      outcome: m.outcome,
-      revealedYesStake: m.revealedYesStake,
-      revealedNoStake: m.revealedNoStake,
-      version: 1
-    }));
-    this.nextMarketId = this.markets.reduce((max, market) => Math.max(max, market.id), -1) + 1;
-    
-    // Seed initial events with placeholder slot
-    for (const m of this.markets) {
-      this.indexer.consumeEvent({
-        marketId: m.id,
-        type: "MARKET_CREATED",
-        actor: "system",
-        details: `Seeded market: ${m.title}`,
-        slot: 0,
-        signature: "GENESIS"
-      });
-    }
-    
-    if (this.persistenceBackend === "sqlite") {
-      this.persistFullStateToDatabase();
-    } else {
-      this.persistSnapshot();
-    }
+  private initializeEmptyState() {
+    // Fresh workspaces now start empty instead of auto-injecting sample markets.
+    // That makes backend/API behavior match what is actually persisted.
+    this.markets = [];
+    this.positions = [];
+    this.nextMarketId = 0;
+    this.nextPositionId = 1000;
   }
 
   private applySnapshot(snapshot: StoreSnapshot) {
@@ -874,11 +840,28 @@ export class OracleStore {
     resolutionSource: string;
     rules: string[];
     creatorWallet: string;
+    marketId?: number;
+    txSig?: string;
   }): StoredMarket {
-    // Today the backend generates the market id/status locally. In a mainnet
-    // setup those values should be mirrored from the program account or indexer.
+    // Chain-backed flows can supply the already-confirmed on-chain id/tx sig so
+    // the backend mirrors program state instead of inventing its own identifiers.
+    const explicitId = input.marketId;
+    const marketId = explicitId ?? this.nextMarketId;
+    const existingIndex = this.markets.findIndex((candidate) => candidate.id === marketId);
+    const existing = existingIndex >= 0 ? this.markets[existingIndex] : undefined;
+
+    if (existing && existing.creator !== "SYSTEM") {
+      throw new Error("Market id already exists.");
+    }
+    if (
+      existing &&
+      this.positions.some((position) => position.marketId === marketId)
+    ) {
+      throw new Error("Cannot replace a seeded market that already has positions.");
+    }
+
     const market: StoredMarket = {
-      id: this.nextMarketId++,
+      id: marketId,
       creator: input.creatorWallet,
       title: input.title,
       description: input.description,
@@ -890,14 +873,20 @@ export class OracleStore {
       resolutionSource: input.resolutionSource,
       version: CURRENT_STORE_VERSION,
     };
+
+    if (existingIndex >= 0) {
+      this.markets.splice(existingIndex, 1);
+    }
     this.markets.unshift(market);
+    this.nextMarketId = Math.max(this.nextMarketId, marketId + 1);
+
     this.indexer.consumeEvent({
       marketId: market.id,
       type: "MARKET_CREATED",
       actor: input.creatorWallet,
       details: `Market created: ${market.title}`,
       slot: 0,
-      signature: randomBytes(32).toString("hex"),
+      signature: input.txSig ?? randomBytes(32).toString("hex"),
     });
     if (this.persistenceBackend === "sqlite") {
       this.persistMarketToDatabase(market);
@@ -918,12 +907,17 @@ export class OracleStore {
   }
 
   submitPosition(input: SubmitPositionInput): { position: StoredPosition; txSig: string } {
-    // Demo shortcut: txSig is generated locally because there is no live
-    // program submission in this codepath yet.
-    const txSig = randomBytes(32).toString("hex");
+    const txSig = input.txSig ?? randomBytes(32).toString("hex");
     const market = this.getMarketById(input.marketId);
     if (!market) {
       throw new Error("Market not found.");
+    }
+    if (
+      this.positions.some(
+        (position) => position.marketId === input.marketId && position.wallet === input.wallet
+      )
+    ) {
+      throw new Error("This wallet already has a position for the selected market.");
     }
     const position: StoredPosition = {
       id: this.nextPositionId++,

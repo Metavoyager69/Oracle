@@ -99,15 +99,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     if (!(await requireWalletAuth(req, res, { wallet, action: "positions:submit", auth }))) return;
 
     try {
-      // Demo path: store records the submission immediately and returns a local
-      // signature placeholder. Mainnet should persist only after the matching
-      // program instruction is accepted and tracked by the backend/indexer.
+      // Chain-backed submissions pass through the confirmed signature here so
+      // the backend mirrors the actual program event instead of inventing one.
       const result = store.submitPosition({
         marketId,
         wallet,
         commitment,
         encryptedStake: parseCipher(req.body?.encryptedStake),
         encryptedChoice: parseCipher(req.body?.encryptedChoice),
+        txSig: typeof req.body?.txSig === "string" ? req.body.txSig : undefined,
       });
 
       res.status(201).json({

@@ -1,9 +1,13 @@
 import { PublicKey } from "@solana/web3.js";
 
-// Shared chain/program constants for the frontend. This file also carries demo
-// fixtures, so juniors should treat it as "UI helpers plus sample data", not as
-// the authoritative source of live market state.
+// Shared chain/program constants for the frontend. Live market data should come
+// from the backend or on-chain reads, while this file stays focused on shared
+// config, PDAs, and UI-safe helper types.
 const DEFAULT_PROGRAM_ID = "7krCLEf4n4QnLnaLgJQTkQB7bS72PRxbM2dGZLb3oQto";
+const TOKEN_PROGRAM_ID_VALUE = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ASSOCIATED_TOKEN_PROGRAM_ID_VALUE = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const DEFAULT_MARKET_TOKEN_SYMBOL = "USDC";
+const DEFAULT_MARKET_TOKEN_DECIMALS = 6;
 
 function parsePublicKey(value: string | undefined, fallback: string): PublicKey {
   try {
@@ -13,15 +17,48 @@ function parsePublicKey(value: string | undefined, fallback: string): PublicKey 
   }
 }
 
+function parseOptionalPublicKey(value: string | undefined): PublicKey | null {
+  try {
+    return value?.trim() ? new PublicKey(value.trim()) : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseTokenDecimals(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 12) {
+    return fallback;
+  }
+  return parsed;
+}
+
 export const PROGRAM_ID = parsePublicKey(
   process.env.NEXT_PUBLIC_PREDICTION_MARKET_PROGRAM_ID,
   DEFAULT_PROGRAM_ID
 );
 // Mainnet rollout: set NEXT_PUBLIC_PREDICTION_MARKET_PROGRAM_ID and
 // NEXT_PUBLIC_SOLANA_RPC together so the UI talks to the correct cluster.
+export const TOKEN_PROGRAM_ID = new PublicKey(TOKEN_PROGRAM_ID_VALUE);
+export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
+  ASSOCIATED_TOKEN_PROGRAM_ID_VALUE
+);
+export const MARKET_TOKEN_MINT = parseOptionalPublicKey(
+  process.env.NEXT_PUBLIC_MARKET_TOKEN_MINT
+);
+export const MARKET_TOKEN_SYMBOL =
+  process.env.NEXT_PUBLIC_MARKET_TOKEN_SYMBOL?.trim() || DEFAULT_MARKET_TOKEN_SYMBOL;
+export const MARKET_TOKEN_DECIMALS = parseTokenDecimals(
+  process.env.NEXT_PUBLIC_MARKET_TOKEN_DECIMALS,
+  DEFAULT_MARKET_TOKEN_DECIMALS
+);
+// The program enforces a raw minimum stake of 1_000_000 base units. The UI uses
+// env-driven decimals so the displayed minimum stays aligned with the chosen mint.
+export const MIN_STAKE_BASE_UNITS = 1_000_000n;
 
 export const MARKET_SEED = Buffer.from("market");
 export const VAULT_SEED = Buffer.from("vault");
+export const BOND_VAULT_SEED = Buffer.from("bond-vault");
 export const POSITION_SEED = Buffer.from("position");
 export const REGISTRY_SEED = Buffer.from("registry");
 
@@ -121,6 +158,12 @@ export function getVaultPDA(marketId: number): [PublicKey, number] {
   return PublicKey.findProgramAddressSync([VAULT_SEED, idBuf], PROGRAM_ID);
 }
 
+export function getBondVaultPDA(marketId: number): [PublicKey, number] {
+  const idBuf = Buffer.alloc(8);
+  idBuf.writeBigUInt64LE(BigInt(marketId));
+  return PublicKey.findProgramAddressSync([BOND_VAULT_SEED, idBuf], PROGRAM_ID);
+}
+
 export function getPositionPDA(
   marketPubkey: PublicKey,
   userPubkey: PublicKey
@@ -133,6 +176,50 @@ export function getPositionPDA(
 
 export const RPC_URL =
   process.env.NEXT_PUBLIC_SOLANA_RPC ?? "https://api.devnet.solana.com";
+
+export function getAssociatedTokenAddress(
+  mint: PublicKey,
+  owner: PublicKey
+): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mint.toBuffer()],
+    ASSOCIATED_TOKEN_PROGRAM_ID
+  )[0];
+}
+
+export function parseTokenAmount(value: string, decimals = MARKET_TOKEN_DECIMALS): bigint | null {
+  const normalized = value.trim();
+  if (!/^\d+(\.\d+)?$/.test(normalized)) return null;
+
+  const [wholePart, fractionPart = ""] = normalized.split(".");
+  const paddedFraction = (fractionPart + "0".repeat(decimals)).slice(0, decimals);
+  try {
+    const whole = BigInt(wholePart || "0");
+    const fraction = BigInt(paddedFraction || "0");
+    return whole * 10n ** BigInt(decimals) + fraction;
+  } catch {
+    return null;
+  }
+}
+
+export function formatTokenAmount(
+  value: bigint,
+  decimals = MARKET_TOKEN_DECIMALS,
+  precision = Math.min(decimals, 4)
+): string {
+  const divisor = 10n ** BigInt(decimals);
+  const whole = value / divisor;
+  const fraction = value % divisor;
+  if (precision === 0) return whole.toString();
+
+  const rawFraction = fraction.toString().padStart(decimals, "0").slice(0, precision);
+  const trimmedFraction = rawFraction.replace(/0+$/, "");
+  return trimmedFraction ? `${whole}.${trimmedFraction}` : whole.toString();
+}
+
+export function formatMinimumStakeLabel(): string {
+  return `${formatTokenAmount(MIN_STAKE_BASE_UNITS)} ${MARKET_TOKEN_SYMBOL}`;
+}
 
 export function calculatePositionPnl(position: DemoPosition): number {
   if (position.visibility === "encrypted") return 0;
@@ -171,39 +258,3 @@ export function getPortfolioSummary(positions: DemoPosition[]) {
     winRate,
   };
 }
-
-export const DEMO_MARKETS: DemoMarket[] = [
-  // Demo fixtures keep the UI explorable before backend/on-chain data is wired.
-  // They should become fallback data only once mainnet-backed APIs are live.
-  {
-    id: 0,
-    category: "Crypto",
-    title: "Will BTC exceed $100k before Q4 2026?",
-    description: "Resolves YES if BTC spot price print on Binance exceeds $100,000.",
-    resolutionTimestamp: new Date("2026-10-01"),
-    status: "Open",
-    totalParticipants: 312,
-    rules: ["Binance API is the source of truth."],
-    resolutionSource: "Binance API",
-    timeline: [
-      { id: "m0_created", label: "Market created", note: "Question locked on-chain.", timestamp: new Date("2026-02-15"), status: "completed" },
-      { id: "m0_open", label: "Positioning", note: "Accepting encrypted bets.", timestamp: new Date("2026-03-01"), status: "active" },
-    ],
-  }
-];
-
-export const DEMO_POSITIONS: DemoPosition[] = [
-  {
-    id: 1001,
-    marketId: 0,
-    marketTitle: "Will BTC exceed $100k before Q4 2026?",
-    side: "YES",
-    stakeSol: 2.8,
-    entryOdds: 0.47,
-    markOdds: 0.55,
-    status: "Open",
-    visibility: "public",
-    submittedAt: new Date("2026-03-02"),
-    choice: true,
-  }
-];

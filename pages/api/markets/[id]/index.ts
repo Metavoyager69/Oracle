@@ -1,5 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { serializeStoredMarket, serializeStoredPosition } from "../../../../utils/api";
+import { requireWalletAuth } from "../../../../lib/server/api-guards";
 import { normalizeWallet, store } from "../../../../lib/server/store";
 
 // API endpoint: returns one market plus related chart/activity/dispute data.
@@ -12,7 +13,7 @@ function parseId(value: string | string[] | undefined): number {
   return Number.parseInt(raw, 10);
 }
 
-export default function handler(req: NextApiRequest, res: NextApiResponse) {
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method !== "GET") {
     res.setHeader("Allow", ["GET"]);
     res.status(405).json({ error: `Method ${req.method ?? "UNKNOWN"} Not Allowed` });
@@ -43,6 +44,23 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   }
   // Reject malformed wallet scopes to prevent accidental data leaks.
   const hasWalletScope = Boolean(walletScope);
+  let historyScope: "wallet" | "wallet_required" | "wallet_auth_required" = "wallet_required";
+
+  if (hasWalletScope) {
+    let auth;
+    try {
+      auth = req.query.auth ? JSON.parse(req.query.auth as string) : undefined;
+    } catch {
+      res.status(400).json({ error: "Invalid auth payload in query." });
+      return;
+    }
+
+    if (!(await requireWalletAuth(req, res, { wallet: walletScope as string, action: "markets:history:view", auth }))) {
+      return;
+    }
+    historyScope = "wallet";
+  }
+
   // Without a valid wallet, history is intentionally hidden.
   const history = hasWalletScope
     ? store
@@ -95,7 +113,7 @@ export default function handler(req: NextApiRequest, res: NextApiResponse) {
   res.status(200).json({
     market: serializeStoredMarket(market),
     history,
-    historyScope: hasWalletScope ? "wallet" : "wallet_required",
+    historyScope,
     probabilityHistory,
     activity,
     disputes,
