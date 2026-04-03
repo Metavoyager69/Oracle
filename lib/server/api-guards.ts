@@ -2,7 +2,6 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { PublicKey } from "@solana/web3.js";
 import nacl from "tweetnacl";
 import { WALLET_AUTH_TTL_MS, buildWalletAuthMessage, isWalletAuthFresh } from "../../utils/wallet-auth";
-import { store } from "./store";
 import { getRedisClient } from "./redis";
 
 // Shared API perimeter checks live here: rate limiting, wallet-auth verification,
@@ -155,6 +154,7 @@ export async function enforceRateLimit(
 
 // [ISSUES 21 & 22 FIX] - Protect internal API endpoints
 export async function requireAdminAuth(req: NextApiRequest, res: NextApiResponse): Promise<boolean> {
+  const { store } = await import("./store");
   const adminWallet = store.getRegistryAuthority();
   const walletInput = req.headers["x-admin-wallet"] as string;
   const authHeader = req.headers["x-admin-auth"] as string;

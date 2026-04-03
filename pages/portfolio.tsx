@@ -10,7 +10,7 @@ import {
   getPortfolioSummary,
 } from "../lib/shared/portfolio";
 import type { DemoPosition } from "../lib/shared/market-types";
-import { deserializePosition, type ApiPosition } from "../utils/api";
+import { deserializePosition, fetchApiJson, type ApiPosition } from "../utils/api";
 import { createWalletAuthPayload } from "../utils/wallet-guard";
 
 // Portfolio is intentionally wallet-scoped and backend-driven. That is the
@@ -48,10 +48,12 @@ export default function PortfolioPage() {
         // safely return private history for one wallet only.
         const auth = await createWalletAuthPayload({ connected, publicKey, signMessage }, "portfolio:view");
         const authParam = encodeURIComponent(JSON.stringify(auth));
-        const response = await fetch(
+        const { response, payload } = await fetchApiJson<{
+          positions?: ApiPosition[];
+          error?: string;
+        }>(
           `/api/portfolio?wallet=${encodeURIComponent(walletAddress)}&auth=${authParam}`
         );
-        const payload = await response.json();
         if (!response.ok) {
           throw new Error(payload?.error ?? "Could not load portfolio.");
         }

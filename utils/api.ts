@@ -262,6 +262,45 @@ export function deserializeSettlementDispute(
   };
 }
 
+function summarizeUnexpectedResponseBody(body: string): string {
+  const compact = body.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return "Empty response body.";
+  }
+  if (/^<!doctype html/i.test(compact) || /^<html/i.test(compact)) {
+    return "Server returned HTML instead of JSON.";
+  }
+  return compact.slice(0, 160);
+}
+
+export async function readApiJson<T>(response: Response): Promise<T> {
+  const rawBody = await response.text();
+  if (!rawBody) {
+    return {} as T;
+  }
+
+  try {
+    return JSON.parse(rawBody) as T;
+  } catch {
+    const contentType = response.headers.get("content-type") ?? "unknown content type";
+    const detail = summarizeUnexpectedResponseBody(rawBody);
+    throw new Error(
+      response.ok
+        ? `Expected JSON response but received ${contentType}. ${detail}`
+        : `Backend returned ${response.status} ${response.statusText}. ${detail}`
+    );
+  }
+}
+
+export async function fetchApiJson<T>(
+  input: RequestInfo | URL,
+  init?: RequestInit
+): Promise<{ response: Response; payload: T }> {
+  const response = await fetch(input, init);
+  const payload = await readApiJson<T>(response);
+  return { response, payload };
+}
+
 function serializeTimelineStep(step: ResolutionTimelineStep): ApiResolutionTimelineStep {
   return {
     ...step,

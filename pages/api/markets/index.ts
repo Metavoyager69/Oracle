@@ -2,7 +2,6 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { MARKET_CATEGORIES, type MarketCategory, type MarketStatus } from "../../../lib/shared/market-types";
 import { serializeStoredMarket } from "../../../utils/api";
 import { enforceRateLimit, rateLimitKey, requireJson, requireWalletAuth } from "../../../lib/server/api-guards";
-import { normalizeWallet, store } from "../../../lib/server/store";
 
 // Markets API is the backend boundary for discovery and creation. Right now it
 // writes to the local application store; on mainnet, the store should mirror
@@ -35,16 +34,29 @@ function parseOptionalMarketId(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function backendErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Backend unavailable.";
+}
+
+async function loadStoreModule() {
+  return import("../../../lib/server/store");
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   if (req.method === "GET") {
-    const status = parseStatus(req.query.status);
-    const category = parseCategory(req.query.category);
-    const search = typeof req.query.search === "string" ? req.query.search : undefined;
+    try {
+      const { store } = await loadStoreModule();
+      const status = parseStatus(req.query.status);
+      const category = parseCategory(req.query.category);
+      const search = typeof req.query.search === "string" ? req.query.search : undefined;
 
-    const markets = store
-      .listMarkets({ status, category, search })
-      .map((market) => serializeStoredMarket(market));
-    res.status(200).json({ markets });
+      const markets = store
+        .listMarkets({ status, category, search })
+        .map((market) => serializeStoredMarket(market));
+      res.status(200).json({ markets });
+    } catch (error) {
+      res.status(503).json({ error: backendErrorMessage(error) });
+    }
     return;
   }
 
@@ -63,9 +75,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       marketId: requestedMarketId,
       txSig,
     } = req.body;
+    let storeModule: Awaited<ReturnType<typeof loadStoreModule>>;
+    try {
+      storeModule = await loadStoreModule();
+    } catch (error) {
+      res.status(503).json({ error: backendErrorMessage(error) });
+      return;
+    }
+
     let creatorWallet: string | undefined;
     try {
-      creatorWallet = normalizeWallet(creatorWalletRaw);
+      creatorWallet = storeModule.normalizeWallet(creatorWalletRaw);
     } catch {
       res.status(400).json({ error: "Invalid wallet address." });
       return;
@@ -89,7 +109,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       // Chain-backed create flow submits the real transaction in the browser,
       // then mirrors the confirmed id/signature here so discovery pages can use
       // the backend without drifting from program state.
-      const market = store.createMarket({
+      const market = storeModule.store.createMarket({
         title,
         description,
         category,
@@ -102,7 +122,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       });
       res.status(201).json({ market: serializeStoredMarket(market) });
     } catch (err) {
-      res.status(409).json({ error: err instanceof Error ? err.message : "Creation failed" });
+      const message = err instanceof Error ? err.message : "Creation failed";
+      const statusCode = /^\[oracle-/.test(message) ? 503 : 409;
+      res.status(statusCode).json({ error: message });
     }
     return;
   }

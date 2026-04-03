@@ -15,7 +15,7 @@ import {
   serializeCiphertext,
 } from "../../lib/arcium/encrypt";
 import { storeStakeNonce } from "../../lib/arcium/nonce-vault";
-import { type ApiMarket, deserializeMarket } from "../../utils/api";
+import { fetchApiJson, type ApiMarket, deserializeMarket } from "../../utils/api";
 import { createWalletAuthPayload, ensureWalletUnlocked } from "../../utils/wallet-guard";
 
 type StepState = "idle" | "encrypting" | "submitting" | "confirmed" | "error";
@@ -64,8 +64,10 @@ export function useMarketDetail(marketId: number, isReady: boolean) {
     setLoadError(null);
 
     try {
-      const response = await fetch(`/api/markets/${targetId}`);
-      const payload = await response.json();
+      const { response, payload } = await fetchApiJson<{
+        market?: ApiMarket;
+        error?: string;
+      }>(`/api/markets/${targetId}`);
       if (!response.ok) {
         throw new Error(payload?.error ?? "Could not load market.");
       }
@@ -154,7 +156,10 @@ export function useMarketDetail(marketId: number, isReady: boolean) {
       "positions:submit"
     );
 
-    const response = await fetch("/api/positions", {
+    const { response, payload: body } = await fetchApiJson<{
+      txSig?: string;
+      error?: string;
+    }>("/api/positions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -164,8 +169,6 @@ export function useMarketDetail(marketId: number, isReady: boolean) {
         ...payload,
       }),
     });
-
-    const body = await response.json();
     if (!response.ok) {
       throw new Error(body?.error ?? "Position submission failed.");
     }

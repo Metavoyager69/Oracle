@@ -3,7 +3,7 @@ import Head from "next/head";
 import Link from "next/link";
 import Navbar from "../components/Navbar";
 import MarketCard from "../components/MarketCard";
-import { deserializeMarket, type ApiMarket } from "../utils/api";
+import { deserializeMarket, fetchApiJson, type ApiMarket } from "../utils/api";
 import type { DemoMarket } from "../lib/shared/market-types";
 
 type FilterMode = "all" | "open" | "settled";
@@ -30,8 +30,10 @@ export default function Home() {
       setLoadError(null);
 
       try {
-        const response = await fetch("/api/markets");
-        const payload = await response.json();
+        const { response, payload } = await fetchApiJson<{
+          markets?: ApiMarket[];
+          error?: string;
+        }>("/api/markets");
 
         if (!response.ok) {
           throw new Error(payload?.error ?? "Could not load markets.");

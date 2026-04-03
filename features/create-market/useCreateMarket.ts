@@ -4,6 +4,7 @@ import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { buildCreateMarketTransaction } from "../../lib/solana/instructions";
 import { MARKET_TOKEN_MINT, MARKET_TOKEN_SYMBOL } from "../../lib/solana/config";
 import { MARKET_CATEGORIES, type MarketCategory } from "../../lib/shared/market-types";
+import { fetchApiJson } from "../../utils/api";
 import { createWalletAuthPayload, ensureWalletUnlocked } from "../../utils/wallet-guard";
 
 interface PendingChainMarket {
@@ -52,7 +53,10 @@ export function useCreateMarket() {
       target?.resolutionTimestamp ?? new Date(`${resolutionDate}T00:00:00.000Z`).toISOString();
     const payloadRules = target?.rules ?? parsedRules;
 
-    const response = await fetch("/api/markets", {
+    const { response, payload } = await fetchApiJson<{
+      market?: { id?: number };
+      error?: string;
+    }>("/api/markets", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -69,7 +73,6 @@ export function useCreateMarket() {
       }),
     });
 
-    const payload = await response.json();
     if (!response.ok) {
       throw new Error(payload?.error ?? "Could not create market.");
     }

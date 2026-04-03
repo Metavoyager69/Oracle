@@ -1,7 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { serializeStoredMarket, serializeStoredPosition } from "../../../../utils/api";
 import { requireWalletAuth } from "../../../../lib/server/api-guards";
-import { normalizeWallet, store } from "../../../../lib/server/store";
 
 // API endpoint: returns one market plus related chart/activity/dispute data.
 // Important privacy rule: position history is wallet-scoped only.
@@ -11,6 +10,14 @@ function parseId(value: string | string[] | undefined): number {
   const raw = Array.isArray(value) ? value[0] : value;
   if (!raw) return Number.NaN;
   return Number.parseInt(raw, 10);
+}
+
+function backendErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Backend unavailable.";
+}
+
+async function loadStoreModule() {
+  return import("../../../../lib/server/store");
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -26,7 +33,15 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return;
   }
 
-  const market = store.getMarketById(id);
+  let storeModule: Awaited<ReturnType<typeof loadStoreModule>>;
+  try {
+    storeModule = await loadStoreModule();
+  } catch (error) {
+    res.status(503).json({ error: backendErrorMessage(error) });
+    return;
+  }
+
+  const market = storeModule.store.getMarketById(id);
   if (!market) {
     res.status(404).json({ error: "Market not found." });
     return;
@@ -36,7 +51,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   let walletScope: string | undefined;
   if (walletRaw) {
     try {
-      walletScope = normalizeWallet(walletRaw);
+      walletScope = storeModule.normalizeWallet(walletRaw);
     } catch {
       res.status(400).json({ error: "Invalid wallet filter." });
       return;
@@ -63,21 +78,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 
   // Without a valid wallet, history is intentionally hidden.
   const history = hasWalletScope
-    ? store
+    ? storeModule.store
         .listPositions({ marketId: id, wallet: walletScope })
         .slice(0, 50)
         .map((position) => serializeStoredPosition(position))
     : [];
 
-  const probabilityHistory = store.getMarketProbabilityHistory(id, 96).map((point) => ({
+  const probabilityHistory = storeModule.store.getMarketProbabilityHistory(id, 96).map((point) => ({
     ...point,
     timestamp: point.timestamp.toISOString(),
   }));
-  const activity = store.getMarketActivity(id, 100).map((event) => ({
+  const activity = storeModule.store.getMarketActivity(id, 100).map((event) => ({
     ...event,
     timestamp: event.timestamp.toISOString(),
   }));
-  const disputes = store.listMarketDisputes(id).map((dispute) => ({
+  const disputes = storeModule.store.listMarketDisputes(id).map((dispute) => ({
     ...dispute,
     createdAt: dispute.createdAt.toISOString(),
     updatedAt: dispute.updatedAt.toISOString(),

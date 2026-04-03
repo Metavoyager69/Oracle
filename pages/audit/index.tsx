@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import Head from "next/head";
 import Navbar from "../../components/Navbar";
+import { fetchApiJson } from "../../utils/api";
 
 export default function AuditPage() {
   const [data, setData] = useState<any>(null);
@@ -9,9 +10,8 @@ export default function AuditPage() {
   useEffect(() => {
     async function fetchMetrics() {
       try {
-        const res = await fetch("/api/audit/metrics");
-        const json = await res.json();
-        setData(json);
+        const { payload } = await fetchApiJson<any>("/api/audit/metrics");
+        setData(payload);
       } catch (err) {
         console.error("Failed to fetch audit metrics", err);
       } finally {
