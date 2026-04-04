@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { promises as fs } from "fs";
+import { tmpdir } from "os";
 import { dirname, resolve } from "path";
 import Database from "better-sqlite3";
 import { Keypair } from "@solana/web3.js";
@@ -24,10 +25,10 @@ import {
   type ResolveDisputeInput,
   type SettlementDisputeRecord,
 } from "./services/dispute-engine";
-import { assertRuntimeConfig, isProdLike } from "./runtime-env";
+import { isProdLike } from "./runtime-env";
 
-// OracleStore owns all persisted market state. It can rehydrate from a
-// normalized sqlite schema or from a JSON snapshot file for local fallback.
+// OracleStore owns all persisted market state. The self-contained default is a
+// JSON snapshot file; sqlite remains available as an opt-in backend.
 const CURRENT_STORE_VERSION = 3; 
 
 const STORE_PATH_ENV = "ORACLE_STORE_PATH";
@@ -36,16 +37,18 @@ const DB_PATH_ENV = "ORACLE_DB_PATH";
 // Resolve persistence paths from the project root so local and deployed
 // environments agree on where fallback files/dbs live.
 const PROJECT_ROOT = process.cwd();
-const DEFAULT_STORE_PATH = resolve(PROJECT_ROOT, "data", "oracle-store.json");
-const DEFAULT_DB_PATH = resolve(PROJECT_ROOT, "data", "oracle-store.db");
+const DEFAULT_DATA_ROOT = isProdLike()
+  ? resolve(tmpdir(), "oracle")
+  : resolve(PROJECT_ROOT, "data");
+const DEFAULT_STORE_PATH = resolve(DEFAULT_DATA_ROOT, "oracle-store.json");
+const DEFAULT_DB_PATH = resolve(DEFAULT_DATA_ROOT, "oracle-store.db");
 const SNAPSHOT_DEBOUNCE_MS = 750;
 const WALLET_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const ADMIN_WALLET_ENV = "ORACLE_ADMIN_WALLET";
 const ADMIN_KEYPAIR_PATH_ENV = "ORACLE_ADMIN_KEYPAIR_PATH";
-const DEFAULT_ADMIN_KEYPAIR_PATH = resolve(PROJECT_ROOT, "data", "oracle-admin-keypair.json");
+const DEFAULT_ADMIN_KEYPAIR_PATH = resolve(DEFAULT_DATA_ROOT, "oracle-admin-keypair.json");
 const DB_SCHEMA_VERSION = 1;
 type StoreBackend = "sqlite" | "file";
-assertRuntimeConfig();
 
 let pendingSnapshot: StoreSnapshot | null = null;
 let pendingBackend: StoreBackend | null = null;
@@ -311,23 +314,19 @@ export interface RelayRevealInput {
 }
 
 function resolveAdminAuthority(): string {
-  // Production should supply a stable admin identity. In local development we
-  // fall back to a generated keypair so the app remains bootable.
-  const inProd = isProdLike();
   const explicit = process.env[ADMIN_WALLET_ENV]?.trim();
   if (explicit) {
     if (!WALLET_PATTERN.test(explicit)) {
-      throw new Error("[oracle-store] ORACLE_ADMIN_WALLET is invalid.");
+      console.warn(
+        "[oracle-store] ORACLE_ADMIN_WALLET is invalid. Falling back to generated admin keypair."
+      );
+    } else {
+      return explicit;
     }
-    return explicit;
   }
 
   const configuredPath = process.env[ADMIN_KEYPAIR_PATH_ENV]?.trim();
   const keypairPath = resolve(configuredPath || DEFAULT_ADMIN_KEYPAIR_PATH);
-
-  if (inProd && !configuredPath) {
-    throw new Error("[oracle-store] Set ORACLE_ADMIN_WALLET or ORACLE_ADMIN_KEYPAIR_PATH in production.");
-  }
 
   try {
     if (existsSync(keypairPath)) {
@@ -335,13 +334,7 @@ function resolveAdminAuthority(): string {
       const keypair = Keypair.fromSecretKey(Uint8Array.from(secret));
       return keypair.publicKey.toBase58();
     }
-    if (inProd) {
-      throw new Error("[oracle-store] Admin keypair file missing in production.");
-    }
   } catch (error) {
-    if (inProd) {
-      throw error;
-    }
     console.warn("[oracle-store] Failed to load admin keypair, generating new one.", error);
   }
 
@@ -354,7 +347,7 @@ function resolveAdminAuthority(): string {
   }
 
   console.warn(
-    "[oracle-store] Generated new admin keypair. Set ORACLE_ADMIN_WALLET in production for stability."
+    "[oracle-store] Generated local admin keypair. Set ORACLE_ADMIN_WALLET if you need a stable authority."
   );
   return keypair.publicKey.toBase58();
 }
@@ -371,17 +364,29 @@ export class OracleStore {
   private persistencePath?: string;
 
   constructor() {
-    this.persistenceBackend = resolveStoreBackend();
-    assertProductionPersistence(this.persistenceBackend);
+    const preferredBackend = resolveStoreBackend();
+    assertProductionPersistence(preferredBackend);
+    this.persistenceBackend = preferredBackend;
     this.persistencePath = resolvePersistencePath(this.persistenceBackend);
-    // Prefer normalized sqlite rehydration when available; the file backend
-    // keeps a full JSON snapshot instead.
-    const snapshot =
-      this.persistenceBackend === "sqlite"
-        ? loadNormalizedStateFromDatabase()
-        : this.persistencePath
-          ? loadSnapshot(this.persistencePath)
-          : null;
+
+    // Try the requested backend first, but keep booting with the file snapshot
+    // backend if sqlite is unavailable in the current environment.
+    let snapshot: StoreSnapshot | null = null;
+    if (this.persistenceBackend === "sqlite") {
+      try {
+        snapshot = loadNormalizedStateFromDatabase();
+      } catch (error) {
+        console.warn(
+          "[oracle-store] SQLite backend unavailable. Falling back to file snapshot storage.",
+          error
+        );
+        this.persistenceBackend = "file";
+        this.persistencePath = resolvePersistencePath("file");
+      }
+    }
+    if (!snapshot && this.persistenceBackend === "file" && this.persistencePath) {
+      snapshot = loadSnapshot(this.persistencePath);
+    }
     
     if (snapshot) {
       if (snapshot.version < CURRENT_STORE_VERSION) {
@@ -1075,13 +1080,13 @@ export class OracleStore {
 function resolveStoreBackend(): StoreBackend {
   const configured = process.env[STORE_BACKEND_ENV]?.trim().toLowerCase();
   if (!configured) {
-    if (isProdLike()) {
-      throw new Error("[oracle-store] ORACLE_STORE_BACKEND must be set to 'sqlite' or 'file' in production.");
-    }
-    return "sqlite";
+    return "file";
   }
   if (configured !== "file" && configured !== "sqlite") {
-    throw new Error("[oracle-store] ORACLE_STORE_BACKEND must be 'sqlite' or 'file'.");
+    console.warn(
+      `[oracle-store] Unsupported ORACLE_STORE_BACKEND "${configured}". Falling back to file snapshots.`
+    );
+    return "file";
   }
   return configured;
 }
@@ -1089,13 +1094,9 @@ function resolveStoreBackend(): StoreBackend {
 function assertProductionPersistence(backend: StoreBackend): void {
   if (!isProdLike()) return;
   if (!process.env[STORE_BACKEND_ENV]) {
-    throw new Error("[oracle-store] ORACLE_STORE_BACKEND must be set in production.");
-  }
-  if (backend === "sqlite" && !process.env[DB_PATH_ENV]) {
-    throw new Error("[oracle-store] ORACLE_DB_PATH must be set for sqlite persistence in production.");
-  }
-  if (backend === "file" && !process.env[STORE_PATH_ENV]) {
-    throw new Error("[oracle-store] ORACLE_STORE_PATH must be set for file persistence in production.");
+    console.warn(
+      `[oracle-store] ORACLE_STORE_BACKEND not set. Using ${backend} with self-contained local storage.`
+    );
   }
 }
 
@@ -1103,10 +1104,7 @@ function resolvePersistencePath(backend: StoreBackend): string | undefined {
   if (backend !== "file") return undefined;
   const configured = process.env[STORE_PATH_ENV]?.trim();
   if (configured) return resolve(configured);
-  if (!isProdLike()) {
-    return DEFAULT_STORE_PATH;
-  }
-  throw new Error("[oracle-store] ORACLE_STORE_PATH must be set for file persistence in production.");
+  return DEFAULT_STORE_PATH;
 }
 
 function resolveDatabasePath(): string {

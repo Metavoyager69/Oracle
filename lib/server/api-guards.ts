@@ -36,8 +36,7 @@ type WalletAuthPayload = {
 
 const buckets = new Map<string, RateLimitState>();
 const MAX_BUCKETS = 10_000;
-// Nonce cache is only a development fallback; production should store replay
-// protection in Redis so it survives serverless/process churn.
+// Nonce cache is the self-contained fallback when Redis is not configured.
 const nonceCache = new Map<string, number>();
 const MAX_NONCE_CACHE = 25_000;
 
@@ -107,13 +106,9 @@ export async function enforceRateLimit(
 ): Promise<boolean> {
   const redis = getRedisClient();
   if (!redis) {
-    if (process.env.NODE_ENV === "production") {
-      log("CRITICAL", "Redis not configured for rate limiting", { key: options.key });
-      res.status(503).json({ error: "Rate limiter unavailable. Configure Upstash Redis." });
-      return false;
-    }
-    // Memory fallback keeps local demos usable, but it is not safe enough for
-    // horizontally scaled production traffic.
+    log("WARN", "Redis not configured for rate limiting, using in-memory fallback", {
+      key: options.key,
+    });
     return enforceRateLimitMemory(req, res, options);
   }
 
@@ -194,7 +189,7 @@ function decodeBase64(value: string): Uint8Array | null {
   }
 }
 
-type NonceResult = "ok" | "replay" | "unavailable";
+type NonceResult = "ok" | "replay";
 
 async function consumeNonce(wallet: string, nonce: string): Promise<NonceResult> {
   const redis = getRedisClient();
@@ -208,11 +203,7 @@ async function consumeNonce(wallet: string, nonce: string): Promise<NonceResult>
       log("ERROR", "Redis nonce store failed, falling back to memory", { error: String(error) });
     }
   }
-
-  if (process.env.NODE_ENV === "production") {
-    log("CRITICAL", "Redis not configured for nonce storage", { wallet });
-    return "unavailable";
-  }
+  log("WARN", "Redis not configured for nonce storage, using in-memory fallback", { wallet });
 
   const now = Date.now();
   const existing = nonceCache.get(key);
@@ -282,10 +273,6 @@ export async function requireWalletAuth(
   }
 
   const nonceResult = await consumeNonce(options.wallet, auth.nonce);
-  if (nonceResult === "unavailable") {
-    res.status(503).json({ error: "Wallet auth unavailable. Configure nonce storage." });
-    return false;
-  }
   if (nonceResult === "replay") {
     log("WARN", "Wallet auth replay detected", { wallet: options.wallet, action: options.action });
     res.status(401).json({ error: "Wallet signature replay detected. Please retry." });
